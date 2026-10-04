@@ -1,855 +1,257 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  ActivityIndicator, Alert, AppState, KeyboardAvoidingView, Modal, Platform, RefreshControl,
-  ScrollView, StyleSheet, Switch, Text, TextInput, ToastAndroid, TouchableOpacity, View,
-} from 'react-native';
-import { StatusBar } from 'expo-status-bar';
-import { Dimensions } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import Ionicons from '@expo/vector-icons/Ionicons';
-import * as DocumentPicker from 'expo-document-picker';
-import { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
-import { initClient, db } from './src/supa';
-import {
-  deleteDecisionsDay, deleteHabit, flushOutbox, getCachedHabits, getOutbox, getResets, getSnoozes, loadDecisions, loadHabits, retryNow,
-  saveHabit, setReset, setSnoozes, submitDecision,
-} from './src/data';
-import * as Alarm from './src/alarm';
-import { PRESETS, iconFor, presetFor } from './src/presets';
-import { buildMessage, dayKey, fmtHHMM, formatDateLong, formatStamp, timeOnly, uuid } from './src/time';
+package expo.modules.nudgealarm
 
-const C = {
-  bg: '#F5F5FB', card: '#FFFFFF', ink: '#15152B', sub: '#6E6E8A', line: '#E8E8F3',
-  primary: '#5B5BD6', primaryDark: '#4343B8', primarySoft: '#ECECFC',
-  green: '#16A068', greenSoft: '#E1F6EC', red: '#DB4B4B', redSoft: '#FCE9E9', amber: '#C77D0A', amberSoft: '#FFF2D9', flame: '#F97316', flameSoft: '#FFEDD9',
-};
-const EMPTY = { name: 'Walk', activity: 'going for a walk', remind_time: '22:00', repeat_seconds: 300, snooze_minutes: 15, chat_url: '', enabled: true };
-const toast = (m) => { if (Platform.OS === 'android') ToastAndroid.show(m, ToastAndroid.LONG); };
-const Icon = ({ name, size = 20, color = C.ink }) => <Ionicons name={name} size={size} color={color} />;
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.media.RingtoneManager
+import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
 
-const InsetsCtx = React.createContext({ top: 24, bottom: 0, left: 0, right: 0 });
-const useInsets = () => React.useContext(InsetsCtx);
+class AlarmService : Service() {
+  companion object {
+    const val CHANNEL = "nudge_alarm_v1"
+    const val TEST_ID = "__test__"
+    @Volatile var instance: AlarmService? = null
 
-// Keeps the UI clear of the status bar and the Android back/home/recents buttons (edge-to-edge screens)
-function useNativeInsets() {
-  const [ins, setIns] = useState(() => Alarm.insets());
-  useEffect(() => {
-    const upd = () => { const n = Alarm.insets(); setIns((p) => (p.top === n.top && p.bottom === n.bottom && p.left === n.left && p.right === n.right ? p : n)); };
-    upd();
-    const t1 = setTimeout(upd, 250), t2 = setTimeout(upd, 900), t3 = setTimeout(upd, 2500);
-    const a = AppState.addEventListener('change', (st) => st === 'active' && upd());
-    const d = Dimensions.addEventListener('change', upd);
-    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); a.remove(); d.remove(); };
-  }, []);
-  return ins;
-}
+    fun notifId(habitId: String): Int = 1000 + (habitId.hashCode() and 0xffff)
 
-export default function App() {
-  const ins = useNativeInsets();
-  return <InsetsCtx.Provider value={ins}><Root /></InsetsCtx.Provider>;
-}
-
-function Root() {
-  const ins = useInsets();
-  const [phase, setPhase] = useState('boot'); // boot | login | main
-  const [cfg, setCfg] = useState({ url: '', key: '', email: '' });
-  const [tab, setTab] = useState('today');
-  const [habits, setHabits] = useState([]);
-  const [decisions, setDecisions] = useState([]);
-  const [snoozes, setSn] = useState({});
-  const [resets, setResets] = useState({});
-  const [offline, setOffline] = useState(false);
-  const [refreshing, setRefreshing] = useState(false);
-  const [editing, setEditing] = useState(null);
-  const [tick, setTick] = useState(0);
-  const lastPress = useRef({});
-  const started = useRef(false);
-  const seen = useRef({});
-
-  const refresh = useCallback(async () => {
-    try { await flushOutbox(); } catch {}
-    try { const { data } = await db().auth.getSession(); if (data?.session) Alarm.setToken(data.session.access_token, (data.session.expires_at || 0) * 1000); } catch {}
-    const [h, d, s, rs] = await Promise.all([loadHabits(), loadDecisions(), getSnoozes(), getResets()]);
-    setHabits(h.habits); setDecisions(d.decisions); setSn(s); setResets(rs); setOffline(h.offline || d.offline);
-    try { Alarm.rescheduleAll(h.habits, d.decisions, s, rs); } catch {}
-    return h.habits;
-  }, []);
-
-  // light refresh (no re-scheduling): announces when a message was delivered to ChatGPT
-  const refreshDecisions = useCallback(async () => {
-    const d = await loadDecisions();
-    setDecisions(d.decisions); setOffline(d.offline);
-    for (const x of d.decisions) {
-      if (seen.current[x.id] && seen.current[x.id] !== 'sent' && x.status === 'sent') toast(`Delivered to ChatGPT: ${x.habit_name}`);
-      seen.current[x.id] = x.status;
+    fun stopFor(c: Context, habitId: String) {
+      val s = instance
+      if (s != null && s.habitId == habitId) s.shutdown()
+      val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+      nm.cancel(notifId(habitId))
     }
-  }, []);
+  }
 
-  // decisions made on the ALARM SCREEN / notification buttons are stored natively; upload them here
-  const flushNative = useCallback(async () => {
-    const items = Alarm.getPending();
-    if (!items.length) return false;
-    const list = await getCachedHabits();
-    const sn = await getSnoozes();
-    const ack = [];
-    for (const it of items) {
-      const habit = list.find((h) => h.id === it.habitId);
-      const when = new Date(it.ts);
-      const snz = (habit && habit.snooze_minutes) || 15;
-      if (habit || it.chatUrl) {
-        // already stored in Supabase by the alarm screen (it.up): skip upload. Otherwise upload now (idempotent id).
-        if (!it.up) {
-          await submitDecision({
-            id: it.id, habit_id: it.habitId, habit_name: habit ? habit.name : it.habitName, decision: it.decision,
-            message: it.message || buildMessage(habit, it.decision, when), chat_url: (habit && habit.chat_url) || it.chatUrl, decided_at: when.toISOString(),
-          });
-          toast(it.decision === 'snoozed' ? `Snoozed ${it.habitName}` : 'Saved. Your laptop will send it to ChatGPT.');
-        }
-        if (it.decision === 'snoozed') sn[it.habitId] = it.ts + snz * 60000; else delete sn[it.habitId];
+  private val handler = Handler(Looper.getMainLooper())
+  private var player: MediaPlayer? = null
+  private var wake: PowerManager.WakeLock? = null
+  @Volatile var habitId: String = ""
+  private var name: String = "Nudge"
+  private var repeatSec = 300
+  private var snoozeMin = 15
+
+  override fun onBind(intent: Intent?): IBinder? = null
+
+  override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    instance = this
+    if (intent == null) { stopSelf(); return START_NOT_STICKY }
+
+    // a different habit may already be ringing: silence it, this one takes over
+    handler.removeCallbacksAndMessages(null)
+    releaseMedia()
+
+    habitId = intent.getStringExtra("habitId") ?: ""
+    name = intent.getStringExtra("name") ?: "Nudge"
+    repeatSec = intent.getIntExtra("repeatSec", 300).coerceAtLeast(60)
+    snoozeMin = intent.getIntExtra("snoozeMin", 15)
+    val chain = intent.getIntExtra("chain", 0)
+    val isTest = intent.getBooleanExtra("test", false) || habitId == TEST_ID
+
+    createChannel()
+    val n = ringingNotification()
+    try {
+      if (Build.VERSION.SDK_INT >= 29) {
+        startForeground(notifId(habitId), n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+      } else {
+        startForeground(notifId(habitId), n)
       }
-      ack.push(it.id);
+    } catch (e: Exception) {
+      try { (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(notifId(habitId), n) } catch (e2: Exception) { }
     }
-    await setSnoozes(sn);
-    Alarm.ackPending(ack);
-    return true;
-  }, []);
 
-  const decide = useCallback(async (habit, decision) => {
-    const k = habit.id + decision;
-    if (Date.now() - (lastPress.current[k] || 0) < 3000) return;
-    lastPress.current[k] = Date.now();
-    const now = new Date();
-    const sent = await submitDecision({
-      id: uuid(), habit_id: habit.id, habit_name: habit.name, decision,
-      message: buildMessage(habit, decision, now), chat_url: habit.chat_url, decided_at: now.toISOString(),
-    });
-    Alarm.stop(habit.id);
-    const sn = await getSnoozes();
-    if (decision === 'snoozed') {
-      const at = Date.now() + (habit.snooze_minutes || 15) * 60000;
-      sn[habit.id] = at; Alarm.snooze(habit, at);
-    } else delete sn[habit.id];
-    await setSnoozes(sn);
-    toast(!sent ? 'Saved on your phone. It will upload when you are online.'
-      : decision === 'snoozed' ? `Snoozed ${habit.snooze_minutes || 15} min` : 'Saved. Your laptop will send it to ChatGPT.');
-    await refresh();
-  }, [refresh]);
+    val ringSec = if (isTest) 30 else minOf(60, repeatSec)
+    acquireWake(ringSec * 1000L + 5000L)
+    startSound()
+    vibrate(true)
 
-  // ---- boot ----
-  useEffect(() => {
-    (async () => {
-      const raw = await AsyncStorage.getItem('nudge.cfg');
-      if (!raw) return setPhase('login');
-      const c = JSON.parse(raw);
-      setCfg(c);
-      const client = initClient(c.url, c.key);
-      const { data } = await client.auth.getSession();
-      setPhase(data.session ? 'main' : 'login');
-    })();
-  }, []);
+    // schedule the next reminder right away (survives process death); answering cancels it
+    if (!isTest) {
+      val maxChain = (7200 / repeatSec).coerceIn(6, 30)
+      if (chain + 1 < maxChain) {
+        Scheduler.scheduleChain(this, habitId, name, repeatSec, snoozeMin, chain + 1, System.currentTimeMillis() + repeatSec * 1000L)
+      }
+    }
 
-  useEffect(() => {
-    if (phase !== 'main' || started.current) return;
-    started.current = true;
-    (async () => {
-      await Alarm.askNotificationPermission();
-      await refresh();
-      if (await flushNative()) await refresh();
-    })();
-    const app = AppState.addEventListener('change', async (st) => {
-      if (st === 'active') {
-        db()?.auth.startAutoRefresh();
-        await refresh();
-        if (await flushNative()) await refresh();
-        setTick((t) => t + 1);
-      } else db()?.auth.stopAutoRefresh();
-    });
-    const timer = setInterval(() => { setTick((t) => t + 1); refreshDecisions(); }, 20000);
-    return () => { app.remove(); clearInterval(timer); started.current = false; };
-  }, [phase, refresh, flushNative, refreshDecisions]);
+    handler.postDelayed({ onRingTimeout() }, ringSec * 1000L)
+    return START_NOT_STICKY
+  }
 
-  const removeHabit = useCallback((h) => {
-    Alert.alert(`Delete “${h.name}”?`, 'Its alarms stop and it disappears from Streaks.', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Delete', style: 'destructive', onPress: async () => {
-        try {
-          await deleteHabit(h.id);
-          Alarm.stop(h.id);
-          const sn = await getSnoozes(); delete sn[h.id]; await setSnoozes(sn);
-          toast('Habit deleted');
-          await refresh();
-        } catch (e) { Alert.alert('Could not delete', e.message || String(e)); }
-      } },
-    ]);
-  }, [refresh]);
-
-  const undoToday = useCallback((h) => {
-    Alert.alert(`Remove today's answer for “${h.name}”?`, 'It is removed from Streaks. If your laptop has not sent it yet, it will not be sent.', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Remove', style: 'destructive', onPress: async () => {
-        try {
-          const st = new Date(); st.setHours(0, 0, 0, 0);
-          const en = new Date(st); en.setDate(en.getDate() + 1);
-          const inDay = (ms) => ms >= +st && ms < +en;
-          const had = decisions.filter((d) => d.habit_id === h.id && d.status !== 'queued' && inDay(new Date(d.decided_at).getTime())).length;
-          const n = await deleteDecisionsDay(h.id, +st, +en);
-          if (had && !n) throw new Error('The database blocked the delete. Run the delete-policy SQL once in Supabase (see chat).');
-          Alarm.ackPending(Alarm.getPending().filter((x) => x.habitId === h.id && inDay(x.ts)).map((x) => x.id));
-          const sn = await getSnoozes(); delete sn[h.id]; await setSnoozes(sn);
-          Alarm.stop(h.id);
-          toast("Today's answer removed");
-          await refresh();
-        } catch (e) { Alert.alert('Could not remove', e.message || String(e)); }
-      } },
-    ]);
-  }, [decisions, refresh]);
-
-  const onRefresh = async () => { setRefreshing(true); await refresh(); setRefreshing(false); };
-
-  if (phase === 'boot') return <View style={[s.fill, s.center]}><ActivityIndicator size="large" color={C.primary} /></View>;
-  if (phase === 'login') return <Login cfg={cfg} onDone={(c) => { setCfg(c); started.current = false; setPhase('main'); }} />;
-
-  const TABS = [['today', 'today', 'Today'], ['habits', 'list', 'Habits'], ['history', 'time', 'History'], ['settings', 'settings', 'Settings']];
-  return (
-    <View style={s.fill}>
-      <StatusBar style="dark" />
-      <View style={[s.header, { paddingTop: ins.top + 10 }]}>
-        {tab === 'streaks' ? (
-          <TouchableOpacity style={s.backBtn} onPress={() => setTab('today')} activeOpacity={0.7}><Icon name="chevron-back" size={22} color={C.ink} /></TouchableOpacity>
-        ) : (
-          <View style={s.logo}><Icon name="alarm" size={20} color="#fff" /></View>
-        )}
-        <Text style={s.title}>{tab === 'streaks' ? 'Streaks' : 'Nudge'}</Text>
-        <View style={{ flex: 1 }} />
-        {tab !== 'streaks' && (
-          <TouchableOpacity style={s.flameBtn} onPress={() => setTab('streaks')} activeOpacity={0.8}>
-            <Icon name="flame" size={17} color={C.flame} /><Text style={s.flameTxt}>Streaks</Text>
-          </TouchableOpacity>
-        )}
-        {offline && <View style={s.offPill}><Icon name="cloud-offline-outline" size={13} color={C.red} /><Text style={s.offTxt}>offline</Text></View>}
-      </View>
-      <ScrollView
-        style={s.fill} contentContainerStyle={{ padding: 16, paddingBottom: 110 + ins.bottom }}
-        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[C.primary]} />}
-        keyboardShouldPersistTaps="handled"
-      >
-        {tab === 'today' && <Today habits={habits} decisions={decisions} snoozes={snoozes} resets={resets} onDecide={decide} onDelete={removeHabit} onUndo={undoToday} tick={tick} goHabits={() => setTab('habits')} />}
-        {tab === 'streaks' && <Streaks habits={habits} decisions={decisions} />}
-        {tab === 'habits' && <Habits habits={habits} onEdit={setEditing} onDelete={removeHabit} />}
-        {tab === 'history' && <History decisions={decisions} habits={habits} onRetry={async (id) => { try { await retryNow(id); onRefresh(); } catch (e) { Alert.alert('Error', e.message); } }} />}
-        {tab === 'settings' && <Settings cfg={cfg} offline={offline} onRefresh={onRefresh}
-          onSignOut={async () => { Alarm.setAuth('', '', '', ''); await db().auth.signOut(); Alarm.rescheduleAll([], [], {}); started.current = false; setPhase('login'); }} />}
-      </ScrollView>
-      {tab === 'habits' && (
-        <TouchableOpacity style={[s.fab, { bottom: 80 + ins.bottom }]} activeOpacity={0.85} onPress={() => setEditing({ ...EMPTY })}>
-          <Icon name="add" size={22} color="#fff" /><Text style={s.fabTxt}>New habit</Text>
-        </TouchableOpacity>
-      )}
-      <View style={[s.tabs, { paddingBottom: 10 + ins.bottom }]}>
-        {TABS.map(([k, ic, l]) => (
-          <TouchableOpacity key={k} style={s.tab} onPress={() => setTab(k)} activeOpacity={0.7}>
-            <Icon name={tab === k ? ic : `${ic}-outline`} size={23} color={tab === k ? C.primary : '#9A9AB5'} />
-            <Text style={[s.tabTxt, tab === k && { color: C.primary, fontWeight: '700' }]}>{l}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
-      {editing && <HabitEditor habit={editing} onClose={() => setEditing(null)} onSaved={async (info) => {
-        setEditing(null);
-        if (info && info.id) {
-          // new time = fresh alarm: stop any running/snoozed chain and forget "already answered today"
-          Alarm.stop(info.id);
-          const sn = await getSnoozes(); delete sn[info.id]; await setSnoozes(sn);
-          if (info.timeChanged) await setReset(info.id, Date.now());
-        }
-        await refresh();
-      }} />}
-    </View>
-  );
-}
-
-// ------------------------------------------------------------------ Login
-function Login({ cfg, onDone }) {
-  const ins = useInsets();
-  const [url, setUrl] = useState(cfg.url || '');
-  const [key, setKey] = useState(cfg.key || '');
-  const [email, setEmail] = useState(cfg.email || '');
-  const [pw, setPw] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState('');
-
-  const go = async () => {
-    setErr('');
-    if (!/^https:\/\/.+\.supabase\.co/i.test(url.trim())) return setErr('Project URL should look like https://abcdxyz.supabase.co');
-    if (key.trim().length < 20 || !email || !pw) return setErr('Fill in every field.');
-    setBusy(true);
+  private fun onRingTimeout() {
+    releaseMedia()
+    vibrate(false)
     try {
-      const client = initClient(url, key);
-      const { error } = await client.auth.signInWithPassword({ email: email.trim(), password: pw });
-      if (error) throw error;
-      Alarm.setAuth(url.trim(), key.trim(), email.trim(), pw);
-      const c = { url: url.trim(), key: key.trim(), email: email.trim() };
-      await AsyncStorage.setItem('nudge.cfg', JSON.stringify(c));
-      onDone(c);
-    } catch (e) { setErr(e.message || 'Could not sign in'); }
-    setBusy(false);
-  };
-
-  return (
-    <KeyboardAvoidingView style={s.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-      <StatusBar style="dark" />
-      <ScrollView contentContainerStyle={{ padding: 24, paddingTop: ins.top + 48, paddingBottom: ins.bottom + 24 }} keyboardShouldPersistTaps="handled">
-        <View style={[s.logo, { width: 64, height: 64, borderRadius: 20 }]}><Icon name="alarm" size={32} color="#fff" /></View>
-        <Text style={[s.title, { fontSize: 32, marginTop: 16 }]}>Nudge</Text>
-        <Text style={{ color: C.sub, marginBottom: 24, marginTop: 4 }}>Connect to your Supabase project (one time).</Text>
-        <Field label="Supabase Project URL" value={url} onChangeText={setUrl} placeholder="https://xxxx.supabase.co" autoCapitalize="none" />
-        <Field label="Supabase publishable key" value={key} onChangeText={setKey} placeholder="sb_publishable_…" autoCapitalize="none" />
-        <Field label="Email" value={email} onChangeText={setEmail} placeholder="you@example.com" autoCapitalize="none" keyboardType="email-address" />
-        <Field label="Password" value={pw} onChangeText={setPw} secureTextEntry autoCapitalize="none" />
-        {!!err && <Text style={{ color: C.red, marginBottom: 12 }}>{err}</Text>}
-        <Btn label={busy ? 'Signing in…' : 'Sign in'} onPress={go} disabled={busy} />
-      </ScrollView>
-    </KeyboardAvoidingView>
-  );
-}
-
-// ------------------------------------------------------------------ Today
-const DELIVERY = {
-  sent: { t: 'Sent to ChatGPT', icon: 'checkmark-done', bg: C.greenSoft, fg: C.green },
-  sending: { t: 'Sending…', icon: 'sync-outline', bg: C.primarySoft, fg: C.primary },
-  pending: { t: 'Waiting for your laptop', icon: 'hourglass-outline', bg: C.amberSoft, fg: C.amber },
-  queued: { t: 'Queued on phone', icon: 'cloud-upload-outline', bg: C.redSoft, fg: C.red },
-};
-
-function Today({ habits, decisions, snoozes, resets, onDecide, onDelete, onUndo, goHabits }) {
-  const now = new Date();
-  const today = dayKey(now);
-  const active = habits.filter((h) => h.enabled);
-  return (
-    <View>
-      <Text style={s.kicker}>TODAY</Text>
-      <Text style={s.h1}>{formatDateLong(now)}</Text>
-      {active.length === 0 && (
-        <Card>
-          <Text style={{ color: C.sub, marginBottom: 14, lineHeight: 20 }}>No habits yet. Create your first one and paste its ChatGPT chat link.</Text>
-          <Btn icon="add" label="Add a habit" onPress={goHabits} />
-        </Card>
-      )}
-      {active.map((h) => {
-        const rs = (resets && resets[h.id]) || 0;
-        const todays = decisions.filter((d) => d.habit_id === h.id && dayKey(new Date(d.decided_at)) === today && new Date(d.decided_at).getTime() > rs);
-        const final = todays.find((d) => d.decision !== 'snoozed');
-        const [hh, mm] = h.remind_time.split(':').map(Number);
-        const due = new Date(); due.setHours(hh, mm, 0, 0);
-        const sn = snoozes[h.id] && snoozes[h.id] > Date.now() ? snoozes[h.id] : null;
-        let chip = { t: `Reminds at ${fmtHHMM(h.remind_time)}`, bg: C.primarySoft, fg: C.primary, icon: 'alarm-outline' };
-        if (final?.decision === 'going') chip = { t: 'Going', bg: C.greenSoft, fg: C.green, icon: 'checkmark-circle' };
-        else if (final?.decision === 'custom') chip = { t: 'Answered', bg: C.primarySoft, fg: C.primary, icon: 'chatbubble-ellipses' };
-        else if (final) chip = { t: 'Skipped today', bg: C.redSoft, fg: C.red, icon: 'close-circle' };
-        else if (sn) chip = { t: `Snoozed until ${timeOnly(new Date(sn))}`, bg: C.amberSoft, fg: C.amber, icon: 'time-outline' };
-        else if (now >= due) chip = { t: 'Due now', bg: C.amberSoft, fg: C.amber, icon: 'notifications' };
-        const dv = final ? DELIVERY[final.status] || DELIVERY.pending : null;
-        return (
-          <Card key={h.id}>
-            <View style={s.row}>
-              <View style={s.iconCircle}><Icon name={iconFor(h)} size={22} color={C.primary} /></View>
-              <View style={{ flex: 1 }}>
-                <Text style={s.cardTitle}>{h.name}</Text>
-                <Chip {...chip} />
-              </View>
-              <TouchableOpacity onPress={() => onDelete(h)} style={s.trash} activeOpacity={0.7} hitSlop={8}><Icon name="trash-outline" size={19} color={C.red} /></TouchableOpacity>
-            </View>
-            {final ? (
-              <View>
-                <Text style={s.msg}>“{final.message}”</Text>
-                <View style={[s.row, { marginTop: 10, justifyContent: 'space-between' }]}>
-                  {dv ? <Chip {...dv} /> : <View />}
-                  <TouchableOpacity onPress={() => onUndo(h)} hitSlop={8}><Text style={{ color: C.red, fontWeight: '700', fontSize: 13 }}>Remove today's answer</Text></TouchableOpacity>
-                </View>
-              </View>
-            ) : (
-              <View style={{ marginTop: 14, gap: 10 }}>
-                <Btn icon="checkmark-circle" label="I'M GOING" color={C.green} onPress={() => onDecide(h, 'going')} />
-                <Btn icon="close-circle" label="I'M NOT GOING" color={C.red} onPress={() => onDecide(h, 'not_going')} />
-                <Btn icon="time-outline" label={`SNOOZE ${h.snooze_minutes || 15} MIN`} color={C.amber} outline onPress={() => onDecide(h, 'snoozed')} />
-              </View>
-            )}
-          </Card>
-        );
-      })}
-    </View>
-  );
-}
-
-// ------------------------------------------------------------------ Habits
-const fmtEvery = (sec) => (sec % 60 === 0 ? `${sec / 60} min` : `${sec}s`);
-function Habits({ habits, onEdit, onDelete }) {
-  return (
-    <View>
-      <Text style={s.kicker}>MANAGE</Text>
-      <Text style={s.h1}>Your habits</Text>
-      {habits.length === 0 && <Text style={{ color: C.sub }}>Nothing yet. Tap “New habit”.</Text>}
-      {habits.map((h) => (
-        <TouchableOpacity key={h.id} onPress={() => onEdit({ ...h })} activeOpacity={0.85}>
-          <Card>
-            <View style={s.row}>
-              <View style={s.iconCircle}><Icon name={iconFor(h)} size={22} color={C.primary} /></View>
-              <View style={{ flex: 1 }}>
-                <Text style={s.cardTitle}>{h.name}</Text>
-                <Text style={s.sub}>{fmtHHMM(h.remind_time)} · repeats every {fmtEvery(h.repeat_seconds)} · snooze {h.snooze_minutes} min</Text>
-              </View>
-              <Chip t={h.enabled ? 'On' : 'Paused'} bg={h.enabled ? C.greenSoft : C.line} fg={h.enabled ? C.green : C.sub} />
-              <TouchableOpacity onPress={() => onDelete(h)} style={s.trash} activeOpacity={0.7} hitSlop={8}><Icon name="trash-outline" size={19} color={C.red} /></TouchableOpacity>
-            </View>
-            <View style={[s.row, { marginTop: 10 }]}>
-              <Icon name="chatbubble-ellipses-outline" size={15} color={C.sub} />
-              <Text style={[s.sub, { flex: 1, marginTop: 0 }]} numberOfLines={1}>{h.chat_url}</Text>
-            </View>
-          </Card>
-        </TouchableOpacity>
-      ))}
-    </View>
-  );
-}
-
-// ------------------------------------------------------------------ History
-const DEC = {
-  going: { icon: 'checkmark-circle', color: C.green },
-  not_going: { icon: 'close-circle', color: C.red },
-  snoozed: { icon: 'time', color: C.amber },
-  custom: { icon: 'chatbubble-ellipses', color: C.primary },
-};;
-function History({ decisions, habits, onRetry }) {
-  const [filter, setFilter] = useState('all');
-  const all = decisions.filter((d) => filter === 'all' || d.habit_id === filter);
-  const list = all.slice(0, 150);
-  const n = (k) => list.filter((d) => d.decision === k).length;
-  return (
-    <View>
-      <Text style={s.kicker}>LOG</Text>
-      <Text style={s.h1}>History</Text>
-      <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 12 }}>
-        {[{ id: 'all', name: 'All' }, ...habits].map((h) => (
-          <TouchableOpacity key={h.id} onPress={() => setFilter(h.id)} style={[s.filterChip, filter === h.id && { backgroundColor: C.primary, borderColor: C.primary }]}>
-            <Text style={{ color: filter === h.id ? '#fff' : C.ink, fontWeight: '600' }}>{h.name}</Text>
-          </TouchableOpacity>
-        ))}
-      </ScrollView>
-      <View style={[s.row, { marginBottom: 14, gap: 14 }]}>
-        <Stat icon="checkmark-circle" color={C.green} n={n('going')} l="going" />
-        <Stat icon="close-circle" color={C.red} n={n('not_going')} l="not going" />
-        <Stat icon="time" color={C.amber} n={n('snoozed')} l="snoozed" />
-      </View>
-      {list.length === 0 && <Text style={{ color: C.sub }}>No decisions yet.</Text>}
-      {list.map((d) => {
-        const dv = DELIVERY[d.status] || DELIVERY.pending;
-        const di = DEC[d.decision] || DEC.going;
-        return (
-          <Card key={d.id}>
-            <View style={s.row}>
-              <Icon name={di.icon} size={22} color={di.color} />
-              <Text style={[s.cardTitle, { flex: 1 }]}>{d.habit_name}</Text>
-              <Text style={s.sub}>{formatStamp(new Date(d.decided_at))}</Text>
-            </View>
-            <Text style={s.msg}>{d.message}</Text>
-            <View style={[s.row, { marginTop: 10, justifyContent: 'space-between' }]}>
-              <Chip {...dv} />
-              {d.status === 'pending' && d.next_attempt_at && (
-                <TouchableOpacity onPress={() => onRetry(d.id)}><Text style={{ color: C.primary, fontWeight: '700' }}>Retry now</Text></TouchableOpacity>
-              )}
-            </View>
-            {!!d.last_error && d.status !== 'sent' && <Text style={{ color: C.red, fontSize: 12, marginTop: 6 }}>Last error: {d.last_error}</Text>}
-          </Card>
-        );
-      })}
-    </View>
-  );
-}
-
-// ------------------------------------------------------------------ Streaks
-const WD = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
-const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const MONTH_FULL = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
-const parseKey = (k) => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
-
-// day -> 'done' | 'skip'. The LAST going / not-going answer of a day wins. Snoozes and typed answers don't count.
-function dayMap(habitId, decisions) {
-  const map = {}, at = {};
-  for (const d of decisions) {
-    if (d.habit_id !== habitId || d.decision === 'snoozed' || d.decision === 'custom') continue;
-    const t = new Date(d.decided_at).getTime();
-    const k = dayKey(new Date(t));
-    if (!at[k] || t > at[k]) { at[k] = t; map[k] = d.decision === 'going' ? 'done' : 'skip'; }
+      stopForeground(Service.STOP_FOREGROUND_DETACH)
+      (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).notify(notifId(habitId), missedNotification())
+    } catch (e: Exception) { }
+    stopSelf()
   }
-  return map;
-}
 
-function streakStats(map) {
-  const keys = Object.keys(map).sort();
-  let completed = 0, skipped = 0, longest = 0, run = 0, prev = null;
-  for (const k of keys) {
-    if (map[k] === 'done') completed++; else skipped++;
-    if (map[k] !== 'done') { run = 0; prev = null; continue; }
-    const dt = parseKey(k);
-    run = prev && Math.round((dt - prev) / 86400000) === 1 ? run + 1 : 1;
-    prev = dt;
-    longest = Math.max(longest, run);
+  fun shutdown() {
+    handler.removeCallbacksAndMessages(null)
+    releaseMedia()
+    vibrate(false)
+    try { stopForeground(Service.STOP_FOREGROUND_REMOVE) } catch (e: Exception) { }
+    try { (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager).cancel(notifId(habitId)) } catch (e: Exception) { }
+    habitId = ""
+    stopSelf()
   }
-  let current = 0;
-  const d = new Date(); d.setHours(0, 0, 0, 0);
-  const tk = dayKey(d);
-  if (map[tk] !== 'skip') {
-    if (map[tk] !== 'done') d.setDate(d.getDate() - 1); // today not answered yet: streak is still alive through yesterday
-    while (map[dayKey(d)] === 'done') { current++; d.setDate(d.getDate() - 1); }
+
+  override fun onDestroy() {
+    handler.removeCallbacksAndMessages(null)
+    releaseMedia()
+    vibrate(false)
+    if (instance === this) instance = null
+    super.onDestroy()
   }
-  return { current, longest, completed, skipped };
-}
 
-const Tile = ({ n, l, color }) => (
-  <View style={s.tile}><Text style={[s.tileN, color && { color }]}>{n}</Text><Text style={s.tileL}>{l}</Text></View>
-);
-
-function DayDot({ d, state, isToday, future, size, showLabel }) {
-  const bg = state === 'done' ? C.green : state === 'skip' ? C.redSoft : 'transparent';
-  const fg = state === 'done' ? '#fff' : state === 'skip' ? C.red : future ? '#C9C9DA' : C.sub;
-  return (
-    <View style={{ alignItems: 'center' }}>
-      <View style={[s.day, { width: size, height: size, borderRadius: size / 2, backgroundColor: bg }, isToday && { borderWidth: 2, borderColor: C.primary }]}>
-        {showLabel && state
-          ? <Icon name={state === 'done' ? 'checkmark' : 'close'} size={size * 0.5} color={fg} />
-          : <Text style={{ color: fg, fontWeight: '700', fontSize: 13 }}>{d.getDate()}</Text>}
-      </View>
-      {showLabel && <Text style={{ color: C.sub, fontSize: 11, marginTop: 4, fontWeight: '600' }}>{d.getDate()}</Text>}
-    </View>
-  );
-}
-
-function Streaks({ habits, decisions }) {
-  const [mode, setMode] = useState('week');
-  const [off, setOff] = useState(0);
-  const now = new Date(); now.setHours(0, 0, 0, 0);
-  const todayK = dayKey(now);
-
-  const rows = habits.map((h) => { const map = dayMap(h.id, decisions); return { h, map, st: streakStats(map) }; });
-  const best = rows.reduce((m, r) => Math.max(m, r.st.current), 0);
-  const total = rows.reduce((m, r) => m + r.st.completed, 0);
-
-  let cells = [], title = '';
-  if (mode === 'week') {
-    const mon = new Date(now); mon.setDate(mon.getDate() - ((mon.getDay() + 6) % 7) - off * 7);
-    cells = Array.from({ length: 7 }, (_, i) => { const d = new Date(mon); d.setDate(mon.getDate() + i); return d; });
-    title = `${cells[0].getDate()} ${MON[cells[0].getMonth()]} – ${cells[6].getDate()} ${MON[cells[6].getMonth()]}`;
-  } else {
-    const first = new Date(now.getFullYear(), now.getMonth() - off, 1);
-    const n = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
-    cells = [...Array((first.getDay() + 6) % 7).fill(null), ...Array.from({ length: n }, (_, i) => new Date(first.getFullYear(), first.getMonth(), i + 1))];
-    while (cells.length % 7) cells.push(null);
-    title = `${MONTH_FULL[first.getMonth()]} ${first.getFullYear()}`;
+  // ---------------------------------------------------------------- sound
+  private fun startSound() {
+    val f = Store.soundFile(this)
+    val attrs = AudioAttributes.Builder()
+      .setUsage(AudioAttributes.USAGE_ALARM)
+      .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+      .build()
+    var mp: MediaPlayer? = null
+    if (f.exists() && f.length() > 0) {
+      try {
+        mp = MediaPlayer()
+        mp.setAudioAttributes(attrs)
+        mp.setDataSource(f.absolutePath)
+        mp.isLooping = true
+        mp.prepare()
+      } catch (e: Exception) { try { mp?.release() } catch (e2: Exception) { }; mp = null }
+    }
+    if (mp == null) {
+      try {
+        mp = MediaPlayer()
+        mp.setAudioAttributes(attrs)
+        mp.setDataSource(this, defaultTone())
+        mp.isLooping = true
+        mp.prepare()
+      } catch (e: Exception) { try { mp?.release() } catch (e2: Exception) { }; mp = null }
+    }
+    try { mp?.start() } catch (e: Exception) { }
+    player = mp
   }
-  const weeks = []; for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
-  const isWeek = mode === 'week';
 
-  return (
-    <View>
-      <Text style={s.kicker}>PROGRESS</Text>
-      <Text style={s.h1}>Your streaks</Text>
+  private fun defaultTone(): Uri =
+    RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+      ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+      ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
 
-      <View style={s.hero}>
-        <View style={{ flex: 1 }}>
-          <Text style={s.heroL}>BEST CURRENT STREAK</Text>
-          <Text style={s.heroN}>{best} <Text style={{ fontSize: 16, fontWeight: '700' }}>{best === 1 ? 'day' : 'days'}</Text></Text>
-        </View>
-        <View style={s.heroSide}><Text style={s.heroSideN}>{total}</Text><Text style={s.heroSideL}>completed</Text></View>
-        <Icon name="flame" size={44} color="#FFD9A8" />
-      </View>
+  private fun releaseMedia() {
+    try { player?.stop() } catch (e: Exception) { }
+    try { player?.release() } catch (e: Exception) { }
+    player = null
+    try { if (wake?.isHeld == true) wake?.release() } catch (e: Exception) { }
+    wake = null
+  }
 
-      <View style={s.seg}>
-        {[['week', 'Week'], ['month', 'Month']].map(([k, l]) => (
-          <TouchableOpacity key={k} style={[s.segBtn, mode === k && s.segOn]} onPress={() => { setMode(k); setOff(0); }} activeOpacity={0.8}>
-            <Text style={{ fontWeight: '800', color: mode === k ? C.primary : C.sub }}>{l}</Text>
-          </TouchableOpacity>
-        ))}
-      </View>
-      <View style={[s.row, { justifyContent: 'space-between', marginBottom: 6 }]}>
-        <TouchableOpacity style={s.nav} onPress={() => setOff(off + 1)} activeOpacity={0.7}><Icon name="chevron-back" size={20} /></TouchableOpacity>
-        <Text style={{ fontWeight: '800', color: C.ink, fontSize: 15 }}>{title}</Text>
-        <TouchableOpacity style={[s.nav, off === 0 && { opacity: 0.3 }]} disabled={off === 0} onPress={() => setOff(off - 1)} activeOpacity={0.7}><Icon name="chevron-forward" size={20} /></TouchableOpacity>
-      </View>
-      <View style={[s.row, { gap: 14, marginBottom: 12, justifyContent: 'center' }]}>
-        <View style={s.row}><View style={[s.legend, { backgroundColor: C.green }]} /><Text style={s.sub}>Completed</Text></View>
-        <View style={s.row}><View style={[s.legend, { backgroundColor: C.redSoft, borderWidth: 1, borderColor: C.red }]} /><Text style={s.sub}>Skipped</Text></View>
-        <View style={s.row}><View style={[s.legend, { borderWidth: 2, borderColor: C.primary }]} /><Text style={s.sub}>Today</Text></View>
-      </View>
-
-      {rows.length === 0 && <Card><Text style={{ color: C.sub }}>No habits yet. Add one in the Habits tab.</Text></Card>}
-      {rows.map(({ h, map, st }) => (
-        <Card key={h.id}>
-          <View style={s.row}>
-            <View style={s.iconCircle}><Icon name={iconFor(h)} size={22} color={C.primary} /></View>
-            <View style={{ flex: 1 }}>
-              <Text style={s.cardTitle}>{h.name}</Text>
-              <Text style={[s.sub, { marginTop: 0 }]}>{st.current > 0 ? `${st.current}-day streak going` : 'No active streak'}</Text>
-            </View>
-            <View style={s.flameChip}><Icon name="flame" size={18} color={C.flame} /><Text style={s.flameNum}>{st.current}</Text></View>
-          </View>
-          <View style={[s.row, { marginTop: 14, gap: 8 }]}>
-            <Tile n={st.longest} l="Longest" color={C.flame} />
-            <Tile n={st.completed} l="Completed" color={C.green} />
-            <Tile n={st.skipped} l="Skipped" color={C.red} />
-          </View>
-          <View style={{ marginTop: 16 }}>
-            <View style={s.calRow}>{WD.map((w, i) => <Text key={i} style={s.calWd}>{w}</Text>)}</View>
-            {weeks.map((wk, wi) => (
-              <View key={wi} style={[s.calRow, { marginTop: isWeek ? 4 : 6 }]}>
-                {wk.map((d, i) => (
-                  <View key={i} style={s.calCell}>
-                    {d && <DayDot d={d} state={map[dayKey(d)]} isToday={dayKey(d) === todayK} future={d > now} size={isWeek ? 38 : 34} showLabel={isWeek} />}
-                  </View>
-                ))}
-              </View>
-            ))}
-          </View>
-        </Card>
-      ))}
-    </View>
-  );
-}
-
-// ------------------------------------------------------------------ Settings
-function Settings({ cfg, offline, onSignOut, onRefresh }) {
-  const [box, setBox] = useState(0);
-  const [st, setSt] = useState({});
-  const [tone, setTone] = useState('');
-  const load = useCallback(() => { setSt(Alarm.status()); setTone(Alarm.soundName()); getOutbox().then((b) => setBox(b.length)); }, []);
-  useEffect(() => { load(); const sub = AppState.addEventListener('change', (x) => x === 'active' && load()); return () => sub.remove(); }, [load, offline]);
-
-  const pick = async () => {
+  private fun acquireWake(ms: Long) {
     try {
-      const r = await DocumentPicker.getDocumentAsync({ type: 'audio/*', copyToCacheDirectory: true });
-      if (r.canceled || !r.assets?.length) return;
-      const a = r.assets[0];
-      await Alarm.setSound(a.uri, a.name || 'Custom sound');
-      setTone(a.name || 'Custom sound');
-      toast('Alarm sound updated');
-    } catch (e) { Alert.alert('Could not use that file', String(e.message || e)); }
-  };
+      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+      wake = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "nudge:alarm")
+      wake?.acquire(ms)
+    } catch (e: Exception) { }
+  }
 
-  const Row = ({ ok, label, kind, hint }) => (
-    <View style={[s.row, { paddingVertical: 8 }]}>
-      <Icon name={ok ? 'checkmark-circle' : 'alert-circle'} size={22} color={ok ? C.green : C.amber} />
-      <View style={{ flex: 1 }}>
-        <Text style={{ color: C.ink, fontWeight: '600' }}>{label}</Text>
-        {!ok && <Text style={s.sub}>{hint}</Text>}
-      </View>
-      {!ok && <TouchableOpacity onPress={() => Alarm.openSettings(kind)}><Text style={{ color: C.primary, fontWeight: '800' }}>FIX</Text></TouchableOpacity>}
-    </View>
-  );
-
-  return (
-    <View>
-      <Text style={s.kicker}>PREFERENCES</Text>
-      <Text style={s.h1}>Settings</Text>
-
-      <Card>
-        <View style={s.row}><Icon name="musical-notes-outline" size={20} color={C.primary} /><Text style={s.cardTitle}>Alarm sound</Text></View>
-        <Text style={s.sub}>{tone ? `Your sound: ${tone}` : 'Default alarm tone'}. Plays on the alarm volume until you answer.</Text>
-        <View style={{ marginTop: 12, gap: 10 }}>
-          <Btn icon="cloud-upload-outline" label="Upload your MP3" onPress={pick} />
-          {!!tone && <Btn label="Back to default tone" outline onPress={() => { Alarm.clearSound(); setTone(''); }} />}
-          <Btn icon="play-outline" label="Test alarm now" outline onPress={() => Alarm.testAlarm(0)} />
-          <Btn icon="lock-closed-outline" label="Test in 10 sec (lock your phone)" outline onPress={() => { Alarm.testAlarm(10000); toast('Lock your phone now'); }} />
-        </View>
-      </Card>
-
-      <Card>
-        <View style={s.row}><Icon name="shield-checkmark-outline" size={20} color={C.primary} /><Text style={s.cardTitle}>Make alarms reliable</Text></View>
-        <Row ok={st.notifications !== false} label="Notifications allowed" kind="notifications" hint="Needed to show the alarm." />
-        <Row ok={st.exact !== false} label="Exact alarms allowed" kind="exact" hint="Lets Android ring exactly on time." />
-        <Row ok={st.fullScreen !== false} label="Full-screen alarm on lock screen" kind="fullscreen" hint="Allow “full screen notifications”." />
-        <Row ok={st.battery === true} label="Battery: unrestricted" kind="battery" hint="Stops Android from delaying alarms." />
-      </Card>
-
-      <Card>
-        <View style={s.row}><Icon name="person-circle-outline" size={20} color={C.primary} /><Text style={s.cardTitle}>Account & sync</Text></View>
-        <Text style={s.sub}>{cfg.email}</Text>
-        <Text style={s.sub}>{cfg.url}</Text>
-        <Text style={s.sub}>Connection: {offline ? 'offline' : 'connected'} · queued on phone: {box}</Text>
-        <View style={{ marginTop: 12, gap: 10 }}>
-          <Btn icon="sync-outline" label="Sync & rebuild alarms" onPress={onRefresh} outline />
-          <Btn icon="log-out-outline" label="Sign out" color={C.red} outline onPress={onSignOut} />
-        </View>
-      </Card>
-    </View>
-  );
-}
-
-// ------------------------------------------------------------------ Habit editor
-function HabitEditor({ habit, onClose, onSaved }) {
-  const ins = useInsets();
-  const [h, setH] = useState(habit);
-  const [busy, setBusy] = useState(false);
-  const initial = presetFor(habit)?.key || (habit.id ? 'custom' : 'walk');
-  const [preset, setPreset] = useState(initial);
-  const set = (k, v) => setH((p) => ({ ...p, [k]: v }));
-  const [hh, mm] = h.remind_time.split(':').map(Number);
-
-  const choose = (p) => {
-    const prev = PRESETS.find((x) => x.key === preset);
-    setPreset(p.key);
-    setH((cur) => ({
-      ...cur,
-      activity: p.activity || '',
-      name: !cur.name.trim() || cur.name === prev?.label ? (p.key === 'custom' ? '' : p.label) : cur.name,
-    }));
-  };
-
-  const pickTime = () => {
-    const d = new Date(); d.setHours(hh, mm, 0, 0);
-    DateTimePickerAndroid.open({
-      value: d, mode: 'time', is24Hour: false,
-      onChange: (e, date) => { if (e.type === 'set' && date) set('remind_time', `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`); },
-    });
-  };
-
-  const save = async () => {
-    if (!h.name.trim()) return Alert.alert('Name needed', 'Give the habit a name.');
-    if (!/^https:\/\/(chatgpt\.com|chat\.openai\.com)\/.+/i.test((h.chat_url || '').trim()))
-      return Alert.alert('ChatGPT link needed', 'Paste the full URL of this habit’s ChatGPT chat, e.g. https://chatgpt.com/c/6ac12e7c-…');
-    const rep = parseInt(String(h.repeat_seconds), 10);
-    const snz = parseInt(String(h.snooze_minutes), 10);
-    if (!(rep >= 60)) return Alert.alert('Repeat interval', 'Minimum is 60 seconds.');
-    if (!(snz >= 1)) return Alert.alert('Snooze', 'Snooze must be at least 1 minute.');
-    const p = PRESETS.find((x) => x.key === preset);
-    const activity = p?.activity || (h.activity || '').trim() || null;
-    setBusy(true);
+  @Suppress("DEPRECATION")
+  private fun vibrate(on: Boolean) {
     try {
-      await saveHabit({ ...h, activity, name: h.name.trim(), chat_url: h.chat_url.trim(), repeat_seconds: rep, snooze_minutes: snz });
-      onSaved({ id: h.id, timeChanged: !!h.id && h.remind_time !== habit.remind_time });
-    } catch (e) { Alert.alert('Could not save', e.message); setBusy(false); }
-  };
+      val v: Vibrator = if (Build.VERSION.SDK_INT >= 31) {
+        (getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager).defaultVibrator
+      } else {
+        getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+      }
+      if (!on) { v.cancel(); return }
+      val pattern = longArrayOf(0, 700, 500)
+      if (Build.VERSION.SDK_INT >= 26) v.vibrate(VibrationEffect.createWaveform(pattern, 0)) else v.vibrate(pattern, 0)
+    } catch (e: Exception) { }
+  }
 
-  const del = () => Alert.alert('Delete habit?', 'History stays, alarms stop.', [
-    { text: 'Cancel', style: 'cancel' },
-    { text: 'Delete', style: 'destructive', onPress: async () => { try { await deleteHabit(h.id); onSaved({ id: h.id }); } catch (e) { Alert.alert('Error', e.message); } } },
-  ]);
+  // ---------------------------------------------------------------- notifications
+  private fun createChannel() {
+    if (Build.VERSION.SDK_INT >= 26) {
+      val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+      if (nm.getNotificationChannel(CHANNEL) == null) {
+        val ch = NotificationChannel(CHANNEL, "Habit alarms", NotificationManager.IMPORTANCE_HIGH)
+        ch.description = "Rings until you answer"
+        ch.setSound(null, null)
+        ch.enableVibration(false)
+        ch.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        nm.createNotificationChannel(ch)
+      }
+    }
+  }
 
-  return (
-    <Modal animationType="slide" onRequestClose={onClose} statusBarTranslucent navigationBarTranslucent>
-      <KeyboardAvoidingView style={s.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView contentContainerStyle={{ padding: 20, paddingTop: ins.top + 24, paddingBottom: ins.bottom + 32 }} keyboardShouldPersistTaps="handled">
-          <Text style={s.kicker}>{h.id ? 'EDIT' : 'NEW'}</Text>
-          <Text style={s.h1}>{h.id ? 'Edit habit' : 'New habit'}</Text>
+  private fun builder(): Notification.Builder =
+    if (Build.VERSION.SDK_INT >= 26) Notification.Builder(this, CHANNEL) else Notification.Builder(this)
 
-          <Text style={s.label}>What is it?</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 16 }}>
-            {PRESETS.map((p) => (
-              <TouchableOpacity key={p.key} onPress={() => choose(p)} activeOpacity={0.8}
-                style={[s.preset, preset === p.key && { backgroundColor: C.primary, borderColor: C.primary }]}>
-                <Icon name={p.icon} size={22} color={preset === p.key ? '#fff' : C.primary} />
-                <Text style={{ marginTop: 4, fontWeight: '700', fontSize: 12, color: preset === p.key ? '#fff' : C.ink }}>{p.label}</Text>
-              </TouchableOpacity>
-            ))}
-          </ScrollView>
+  private fun activityPi(slot: Int, decision: String?): PendingIntent {
+    val i = Intent(this, AlarmActivity::class.java)
+    i.putExtra("habitId", habitId)
+    i.putExtra("name", name)
+    i.putExtra("repeatSec", repeatSec)
+    i.putExtra("snoozeMin", snoozeMin)
+    if (decision != null) i.putExtra("decision", decision)
+    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+    return PendingIntent.getActivity(this, notifId(habitId) * 10 + slot, i, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+  }
 
-          <Field label="Habit name" value={h.name} onChangeText={(v) => set('name', v)} placeholder="Evening Walk" />
-          {preset === 'custom' && (
-            <Field label="Message wording (optional)" value={h.activity || ''} onChangeText={(v) => set('activity', v)} placeholder="doing yoga"
-              hint={`Empty = “I'm not doing ${h.name || 'it'} today”`} />
-          )}
-          <Text style={s.label}>Reminder time</Text>
-          <TouchableOpacity style={[s.input, s.row, { marginBottom: 14 }]} onPress={pickTime}>
-            <Text style={{ fontSize: 16, color: C.ink }}>{fmtHHMM(h.remind_time)}</Text><Icon name="time-outline" size={20} color={C.sub} />
-          </TouchableOpacity>
-          <Field label="Remind again every (seconds)" value={String(h.repeat_seconds)} onChangeText={(v) => set('repeat_seconds', v.replace(/\D/g, ''))}
-            keyboardType="number-pad" hint="Min 60. The alarm rings, then rings again until you answer (up to ~2 hours)." />
-          <Field label="Snooze (minutes)" value={String(h.snooze_minutes)} onChangeText={(v) => set('snooze_minutes', v.replace(/\D/g, ''))} keyboardType="number-pad" />
-          <Field label="ChatGPT chat URL" value={h.chat_url} onChangeText={(v) => set('chat_url', v)} placeholder="https://chatgpt.com/c/…" autoCapitalize="none"
-            hint="Open this habit's chat in ChatGPT and copy the link from the address bar." />
-          <View style={[s.row, { marginVertical: 12 }]}><Text style={s.label}>Enabled</Text><Switch value={h.enabled} onValueChange={(v) => set('enabled', v)} trackColor={{ true: C.primary }} /></View>
-          <Btn label={busy ? 'Saving…' : 'Save habit'} onPress={save} disabled={busy} />
-          <View style={{ height: 10 }} />
-          <Btn label="Cancel" outline onPress={onClose} />
-          {h.id && <><View style={{ height: 10 }} /><Btn icon="trash-outline" label="Delete habit" color={C.red} outline onPress={del} /></>}
-        </ScrollView>
-      </KeyboardAvoidingView>
-    </Modal>
-  );
+  @Suppress("DEPRECATION")
+  private fun withActions(b: Notification.Builder): Notification.Builder {
+    val icon = android.R.drawable.ic_lock_idle_alarm
+    // Android shows max 3 notification buttons: GOING, NOT GOING, TYPE ANSWER (snooze = tap notification)
+    b.addAction(icon, "I'M GOING", activityPi(1, "going"))
+    b.addAction(icon, "I'M NOT GOING", activityPi(2, "not_going"))
+    b.addAction(Decisions.replyAction(this, habitId, name, repeatSec, snoozeMin, notifId(habitId) * 10))
+    return b
+  }
+
+  private fun ringingNotification(): Notification {
+    val ui = activityPi(0, null)
+    val b = builder()
+      .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+      .setContentTitle(name)
+      .setContentText("Time for $name — are you going?")
+      .setCategory(Notification.CATEGORY_ALARM)
+      .setPriority(Notification.PRIORITY_MAX)
+      .setOngoing(true)
+      .setAutoCancel(false)
+      .setVisibility(Notification.VISIBILITY_PUBLIC)
+      .setContentIntent(ui)
+      .setFullScreenIntent(ui, true)
+    return withActions(b).build()
+  }
+
+  private fun missedNotification(): Notification {
+    val ui = activityPi(0, null)
+    val b = builder()
+      .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+      .setContentTitle(name)
+      .setContentText("Still waiting for your answer — I'll remind you again.")
+      .setCategory(Notification.CATEGORY_REMINDER)
+      .setPriority(Notification.PRIORITY_HIGH)
+      .setOngoing(false)
+      .setAutoCancel(false)
+      .setOnlyAlertOnce(true)
+      .setVisibility(Notification.VISIBILITY_PUBLIC)
+      .setContentIntent(ui)
+    return withActions(b).build()
+  }
 }
-
-// ------------------------------------------------------------------ UI bits
-const Card = ({ children }) => <View style={s.card}>{children}</View>;
-const Chip = ({ t, bg, fg, icon }) => (
-  <View style={[s.chip, { backgroundColor: bg }]}>
-    {!!icon && <Icon name={icon} size={13} color={fg} />}
-    <Text style={{ color: fg, fontWeight: '700', fontSize: 12 }}>{t}</Text>
-  </View>
-);
-const Stat = ({ icon, color, n, l }) => (
-  <View style={[s.row, { gap: 5 }]}><Icon name={icon} size={18} color={color} /><Text style={{ color: C.ink, fontWeight: '800' }}>{n}</Text><Text style={s.sub}>{l}</Text></View>
-);
-const Field = ({ label, hint, ...p }) => (
-  <View style={{ marginBottom: 14 }}>
-    <Text style={s.label}>{label}</Text>
-    <TextInput style={s.input} placeholderTextColor="#A5A5BC" {...p} />
-    {!!hint && <Text style={{ color: C.sub, fontSize: 12, marginTop: 4, lineHeight: 17 }}>{hint}</Text>}
-  </View>
-);
-const Btn = ({ label, onPress, color = C.primary, outline, disabled, icon }) => (
-  <TouchableOpacity onPress={onPress} disabled={disabled} activeOpacity={0.8}
-    style={[s.btn, outline ? { borderColor: color, borderWidth: 1.5, backgroundColor: 'transparent' } : { backgroundColor: color }, disabled && { opacity: 0.5 }]}>
-    {!!icon && <Icon name={icon} size={20} color={outline ? color : '#fff'} />}
-    <Text style={[s.btnTxt, outline && { color }]}>{label}</Text>
-  </TouchableOpacity>
-);
-
-const shadow = { shadowColor: '#2B2B6B', shadowOpacity: 0.07, shadowRadius: 12, shadowOffset: { width: 0, height: 4 }, elevation: 2 };
-const s = StyleSheet.create({
-  fill: { flex: 1, backgroundColor: C.bg }, center: { alignItems: 'center', justifyContent: 'center' },
-  header: { flexDirection: 'row', alignItems: 'center', paddingTop: 50, paddingHorizontal: 16, paddingBottom: 6, gap: 10 },
-  logo: { width: 36, height: 36, borderRadius: 11, backgroundColor: C.primary, alignItems: 'center', justifyContent: 'center' },
-  title: { fontSize: 24, fontWeight: '800', color: C.ink, letterSpacing: -0.5 },
-  offPill: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: C.redSoft, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 3 },
-  offTxt: { color: C.red, fontSize: 12, fontWeight: '700' },
-  kicker: { fontSize: 11, fontWeight: '800', color: C.primary, letterSpacing: 1.4 },
-  h1: { fontSize: 26, fontWeight: '800', color: C.ink, marginBottom: 14, marginTop: 2, letterSpacing: -0.5 },
-  card: { backgroundColor: C.card, borderRadius: 20, padding: 16, marginBottom: 14, ...shadow },
-  iconCircle: { width: 44, height: 44, borderRadius: 14, backgroundColor: C.primarySoft, alignItems: 'center', justifyContent: 'center' },
-  cardTitle: { fontSize: 17, fontWeight: '800', color: C.ink, marginBottom: 4 },
-  row: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  sub: { color: C.sub, fontSize: 13, marginTop: 3, lineHeight: 19 },
-  msg: { color: C.ink, marginTop: 12, fontSize: 14, lineHeight: 21 },
-  chip: { flexDirection: 'row', alignItems: 'center', gap: 4, alignSelf: 'flex-start', borderRadius: 12, paddingHorizontal: 10, paddingVertical: 4 },
-  filterChip: { backgroundColor: C.card, borderRadius: 18, paddingHorizontal: 16, paddingVertical: 9, marginRight: 8, borderWidth: 1, borderColor: C.line },
-  preset: { width: 78, height: 74, borderRadius: 18, backgroundColor: C.card, borderWidth: 1.5, borderColor: C.line, alignItems: 'center', justifyContent: 'center', marginRight: 10 },
-  label: { fontSize: 13, fontWeight: '700', color: C.ink, marginBottom: 7 },
-  input: { backgroundColor: C.card, borderWidth: 1, borderColor: C.line, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 13, fontSize: 16, color: C.ink },
-  btn: { flexDirection: 'row', gap: 8, borderRadius: 16, paddingVertical: 15, alignItems: 'center', justifyContent: 'center' },
-  btnTxt: { color: '#fff', fontWeight: '800', fontSize: 15, letterSpacing: 0.4 },
-  tabs: { position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', backgroundColor: C.card, borderTopWidth: 1, borderColor: C.line, paddingTop: 9 },
-  tab: { flex: 1, alignItems: 'center', gap: 2 }, tabTxt: { fontSize: 11, color: '#9A9AB5', fontWeight: '600' },
-  backBtn: { width: 36, height: 36, borderRadius: 11, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center', ...shadow },
-  flameBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: C.flameSoft, borderRadius: 16, paddingHorizontal: 12, paddingVertical: 7 },
-  flameTxt: { color: C.flame, fontWeight: '800', fontSize: 13 },
-  trash: { width: 36, height: 36, borderRadius: 12, backgroundColor: C.redSoft, alignItems: 'center', justifyContent: 'center' },
-  hero: { flexDirection: 'row', alignItems: 'center', gap: 14, backgroundColor: C.primary, borderRadius: 24, padding: 20, marginBottom: 16, ...shadow },
-  heroL: { color: '#C9C9F5', fontSize: 11, fontWeight: '800', letterSpacing: 1.2 },
-  heroN: { color: '#fff', fontSize: 40, fontWeight: '800', letterSpacing: -1, marginTop: 2 },
-  heroSide: { alignItems: 'center', paddingHorizontal: 12, borderLeftWidth: 1, borderLeftColor: 'rgba(255,255,255,0.25)' },
-  heroSideN: { color: '#fff', fontSize: 22, fontWeight: '800' },
-  heroSideL: { color: '#C9C9F5', fontSize: 11, fontWeight: '600' },
-  seg: { flexDirection: 'row', backgroundColor: '#E8E8F3', borderRadius: 14, padding: 4, marginBottom: 12 },
-  segBtn: { flex: 1, alignItems: 'center', paddingVertical: 9, borderRadius: 11 },
-  segOn: { backgroundColor: C.card, ...shadow },
-  nav: { width: 36, height: 36, borderRadius: 12, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center' },
-  legend: { width: 12, height: 12, borderRadius: 6 },
-  flameChip: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: C.flameSoft, borderRadius: 14, paddingHorizontal: 12, paddingVertical: 7 },
-  flameNum: { color: C.flame, fontWeight: '800', fontSize: 20 },
-  tile: { flex: 1, backgroundColor: C.bg, borderRadius: 16, paddingVertical: 12, alignItems: 'center' },
-  tileN: { fontSize: 24, fontWeight: '800', color: C.ink },
-  tileL: { fontSize: 12, color: C.sub, fontWeight: '600', marginTop: 2 },
-  calRow: { flexDirection: 'row' },
-  calWd: { flex: 1, textAlign: 'center', color: C.sub, fontSize: 11, fontWeight: '800', marginBottom: 2 },
-  calCell: { flex: 1, alignItems: 'center', justifyContent: 'center' },
-  day: { alignItems: 'center', justifyContent: 'center' },
-  fab: { position: 'absolute', right: 16, bottom: 92, flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: C.primary, borderRadius: 30, paddingHorizontal: 20, paddingVertical: 14, elevation: 5 },
-  fabTxt: { color: '#fff', fontWeight: '800' },
-});
