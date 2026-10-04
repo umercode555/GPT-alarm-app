@@ -1,19 +1,26 @@
 package expo.modules.nudgealarm
 
 import android.app.Activity
+import android.app.RemoteInput
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -23,15 +30,17 @@ class AlarmActivity : Activity() {
   private var habitName = "Nudge"
   private var repeatSec = 300
   private var snoozeMin = 15
+  private var busy = false
+  private val ui = Handler(Looper.getMainLooper())
+  private var input: EditText? = null
 
   private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     readExtras(intent)
-    val decision = intent?.getStringExtra("decision")
-    if (decision != null) { act(decision); return }
-    showScreen()
+    setupWindow()
+    if (!handleIntent(intent)) showScreen()
   }
 
   override fun onNewIntent(intent: Intent?) {
@@ -39,8 +48,12 @@ class AlarmActivity : Activity() {
     if (intent == null) return
     setIntent(intent)
     readExtras(intent)
-    val decision = intent.getStringExtra("decision")
-    if (decision != null) act(decision)
+    handleIntent(intent)
+  }
+
+  override fun onDestroy() {
+    ui.removeCallbacksAndMessages(null)
+    super.onDestroy()
   }
 
   private fun readExtras(i: Intent?) {
@@ -51,14 +64,46 @@ class AlarmActivity : Activity() {
     snoozeMin = i.getIntExtra("snoozeMin", snoozeMin)
   }
 
-  private fun act(decision: String) {
-    Decisions.handle(this, habitId, habitName, decision, snoozeMin, repeatSec)
-    Decisions.openApp(this)
-    finish()
+  /** true = this intent carried an answer (button on the notification, or typed text from the notification) */
+  private fun handleIntent(i: Intent): Boolean {
+    val d = i.getStringExtra("decision") ?: return false
+    if (d == "custom") {
+      val txt = RemoteInput.getResultsFromIntent(i)?.getCharSequence(Decisions.KEY_REPLY)?.toString()?.trim().orEmpty()
+      if (txt.isEmpty()) return false
+      act("custom", txt)
+    } else act(d, null)
+    return true
+  }
+
+  private fun act(decision: String, custom: String?) {
+    if (busy) return
+    busy = true
+    showStatus("#2B2B45", "…", "Sending…", habitName)
+    val item = Decisions.handle(this, habitId, habitName, decision, snoozeMin, repeatSec, custom)
+    val app = applicationContext
+    Thread {
+      val ok = try { if (item == null) true else Decisions.upload(app, item) } catch (e: Exception) { false }
+      ui.post {
+        if (isFinishing || isDestroyed) return@post
+        val msg = item?.optString("message") ?: ""
+        val title = when {
+          !ok -> "Saved on your phone"
+          decision == "snoozed" -> "Snoozed $snoozeMin min"
+          else -> "Message sent to your laptop"
+        }
+        val sub = when {
+          !ok -> "It will be sent automatically when you are online.\n\n$msg"
+          decision == "snoozed" -> "Message sent to your laptop.\n\n$msg"
+          else -> msg
+        }
+        showStatus("#17A05D", "✓", title, sub)
+        ui.postDelayed({ finish() }, 2400)
+      }
+    }.start()
   }
 
   @Suppress("DEPRECATION")
-  private fun showScreen() {
+  private fun setupWindow() {
     if (Build.VERSION.SDK_INT >= 27) {
       setShowWhenLocked(true)
       setTurnScreenOn(true)
@@ -66,12 +111,28 @@ class AlarmActivity : Activity() {
       window.addFlags(WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON)
     }
     window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
+  }
 
+  private fun showStatus(bg: String, icon: String, title: String, sub: String) {
+    input = null
+    val root = LinearLayout(this)
+    root.orientation = LinearLayout.VERTICAL
+    root.gravity = Gravity.CENTER
+    root.setBackgroundColor(Color.parseColor(bg))
+    root.setPadding(dp(28), dp(40), dp(28), dp(40))
+    root.addView(label(icon, 88f, "#FFFFFF", true, 0))
+    root.addView(label(title, 26f, "#FFFFFF", true, 12))
+    if (sub.isNotEmpty()) root.addView(label(sub, 16f, "#E8FFF3", false, 14))
+    setContentView(root)
+  }
+
+  private fun showScreen() {
     val root = LinearLayout(this)
     root.orientation = LinearLayout.VERTICAL
     root.gravity = Gravity.CENTER_HORIZONTAL
     root.setBackgroundColor(Color.parseColor("#14141F"))
-    root.setPadding(dp(24), dp(96), dp(24), dp(40))
+    root.setPadding(dp(24), dp(72), dp(24), dp(32))
 
     root.addView(label("NUDGE", 13f, "#8E8EF0", true, 0))
     root.addView(label(habitName, 34f, "#FFFFFF", true, 8))
@@ -82,10 +143,50 @@ class AlarmActivity : Activity() {
     spacer.layoutParams = LinearLayout.LayoutParams(0, 0, 1f)
     root.addView(spacer)
 
-    root.addView(button("I'M GOING", "#1E9E63", "going"))
-    root.addView(button("I'M NOT GOING", "#D64545", "not_going"))
-    root.addView(button("SNOOZE $snoozeMin MIN", "#C27A06", "snoozed"))
-    setContentView(root)
+    root.addView(button("I'M GOING", "#1E9E63") { act("going", null) })
+    root.addView(button("I'M NOT GOING", "#D64545") { act("not_going", null) })
+    root.addView(button("SNOOZE $snoozeMin MIN", "#C27A06") { act("snoozed", null) })
+
+    // 4th option: type your own answer
+    val et = EditText(this)
+    et.hint = "Or type your own answer…"
+    et.setHintTextColor(Color.parseColor("#7C7C98"))
+    et.setTextColor(Color.WHITE)
+    et.textSize = 16f
+    et.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+    et.minLines = 2
+    et.maxLines = 4
+    et.gravity = Gravity.TOP or Gravity.START
+    val bg = GradientDrawable()
+    bg.setColor(Color.parseColor("#23233A"))
+    bg.cornerRadius = dp(16).toFloat()
+    bg.setStroke(dp(1), Color.parseColor("#3A3A5C"))
+    et.background = bg
+    et.setPadding(dp(16), dp(12), dp(16), dp(12))
+    val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    lp.topMargin = dp(22)
+    et.layoutParams = lp
+    root.addView(et)
+    input = et
+
+    root.addView(button("SEND MY ANSWER", "#5B5BD6") {
+      val t = et.text.toString().trim()
+      if (t.isEmpty()) Toast.makeText(this, "Type your answer first", Toast.LENGTH_SHORT).show() else act("custom", t)
+    })
+
+    val sv = ScrollView(this)
+    sv.isFillViewport = true
+    sv.setBackgroundColor(Color.parseColor("#14141F"))
+    sv.addView(root, ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    sv.setOnApplyWindowInsetsListener { _, ins ->
+      @Suppress("DEPRECATION")
+      val top = ins.systemWindowInsetTop
+      @Suppress("DEPRECATION")
+      val bottom = ins.systemWindowInsetBottom
+      root.setPadding(dp(24), if (top > 0) top + dp(40) else dp(72), dp(24), dp(32) + bottom)
+      ins
+    }
+    setContentView(sv)
   }
 
   private fun label(text: String, size: Float, color: String, bold: Boolean, topDp: Int): TextView {
@@ -101,7 +202,7 @@ class AlarmActivity : Activity() {
     return t
   }
 
-  private fun button(text: String, color: String, decision: String): Button {
+  private fun button(text: String, color: String, onClick: () -> Unit): Button {
     val b = Button(this)
     b.text = text
     b.textSize = 16f
@@ -114,7 +215,7 @@ class AlarmActivity : Activity() {
     val lp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(62))
     lp.topMargin = dp(12)
     b.layoutParams = lp
-    b.setOnClickListener { act(decision) }
+    b.setOnClickListener { onClick() }
     return b
   }
 }
