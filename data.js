@@ -1,7 +1,7 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { db } from './supa';
 
-const K = { habits: 'nudge.habits', decisions: 'nudge.decisions', outbox: 'nudge.outbox', snoozes: 'nudge.snoozes', handled: 'nudge.handled' };
+const K = { habits: 'nudge.habits', decisions: 'nudge.decisions', outbox: 'nudge.outbox', resets: 'nudge.resets', snoozes: 'nudge.snoozes', handled: 'nudge.handled' };
 
 const read = async (k, d) => {
   try { const v = await AsyncStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; }
@@ -44,7 +44,7 @@ export async function deleteHabit(id) {
 }
 
 export async function loadDecisions() {
-  const { data, error } = await db().from('decisions').select('*').order('decided_at', { ascending: false }).limit(300);
+  const { data, error } = await db().from('decisions').select('*').order('decided_at', { ascending: false }).limit(1000);
   const outbox = await getOutbox();
   const queued = outbox.map((r) => ({ ...r, status: 'queued' }));
   if (error) {
@@ -59,7 +59,11 @@ export async function loadDecisions() {
 
 // Insert is idempotent (client-generated id + ignoreDuplicates), so retrying can never create a duplicate.
 async function insertOne(row) {
-  const { error } = await db().from('decisions').upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+  let { error } = await db().from('decisions').upsert(row, { onConflict: 'id', ignoreDuplicates: true });
+  // table may only allow going/not_going/snoozed: store a typed answer as "going" (message text is what counts)
+  if (error && row.decision === 'custom' && error.code === '23514') {
+    ({ error } = await db().from('decisions').upsert({ ...row, decision: 'going' }, { onConflict: 'id', ignoreDuplicates: true }));
+  }
   if (error) throw error;
 }
 
@@ -88,3 +92,20 @@ export async function retryNow(id) {
   const { error } = await db().from('decisions').update({ next_attempt_at: null }).eq('id', id).eq('status', 'pending');
   if (error) throw error;
 }
+
+// habitId -> timestamp: "answers before this moment no longer count for today's alarm" (set when a habit's time is edited)
+export const getResets = () => read(K.resets, {});
+export async function setReset(habitId, ts) { const r = await getResets(); r[habitId] = ts; await write(K.resets, r); }
+
+// Remove one habit's answers for one day (undo). Returns how many Supabase rows were deleted.
+export async function deleteDecisionsDay(habitId, startMs, endMs) {
+  const { data, error } = await db().from('decisions').delete()
+    .eq('habit_id', habitId).gte('decided_at', new Date(startMs).toISOString()).lt('decided_at', new Date(endMs).toISOString()).select('id');
+  if (error) throw error;
+  const box = await getOutbox();
+  await write(K.outbox, box.filter((r) => {
+    const t = new Date(r.decided_at).getTime();
+    return !(r.habit_id === habitId && t >= startMs && t < endMs);
+  }));
+  return data ? data.length : 0;
+}.
