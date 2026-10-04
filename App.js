@@ -4,14 +4,15 @@ import {
   ScrollView, StyleSheet, Switch, Text, TextInput, ToastAndroid, TouchableOpacity, View,
 } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
+import { Dimensions } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Ionicons from '@expo/vector-icons/Ionicons';
 import * as DocumentPicker from 'expo-document-picker';
 import { DateTimePickerAndroid } from '@react-native-community/datetimepicker';
 import { initClient, db } from './src/supa';
 import {
-  deleteHabit, flushOutbox, getCachedHabits, getOutbox, getSnoozes, loadDecisions, loadHabits, retryNow,
-  saveHabit, setSnoozes, submitDecision,
+  deleteDecisionsDay, deleteHabit, flushOutbox, getCachedHabits, getOutbox, getResets, getSnoozes, loadDecisions, loadHabits, retryNow,
+  saveHabit, setReset, setSnoozes, submitDecision,
 } from './src/data';
 import * as Alarm from './src/alarm';
 import { PRESETS, iconFor, presetFor } from './src/presets';
@@ -20,19 +21,43 @@ import { buildMessage, dayKey, fmtHHMM, formatDateLong, formatStamp, timeOnly, u
 const C = {
   bg: '#F5F5FB', card: '#FFFFFF', ink: '#15152B', sub: '#6E6E8A', line: '#E8E8F3',
   primary: '#5B5BD6', primaryDark: '#4343B8', primarySoft: '#ECECFC',
-  green: '#16A068', greenSoft: '#E1F6EC', red: '#DB4B4B', redSoft: '#FCE9E9', amber: '#C77D0A', amberSoft: '#FFF2D9',
+  green: '#16A068', greenSoft: '#E1F6EC', red: '#DB4B4B', redSoft: '#FCE9E9', amber: '#C77D0A', amberSoft: '#FFF2D9', flame: '#F97316', flameSoft: '#FFEDD9',
 };
 const EMPTY = { name: 'Walk', activity: 'going for a walk', remind_time: '22:00', repeat_seconds: 300, snooze_minutes: 15, chat_url: '', enabled: true };
 const toast = (m) => { if (Platform.OS === 'android') ToastAndroid.show(m, ToastAndroid.LONG); };
 const Icon = ({ name, size = 20, color = C.ink }) => <Ionicons name={name} size={size} color={color} />;
 
+const InsetsCtx = React.createContext({ top: 24, bottom: 0, left: 0, right: 0 });
+const useInsets = () => React.useContext(InsetsCtx);
+
+// Keeps the UI clear of the status bar and the Android back/home/recents buttons (edge-to-edge screens)
+function useNativeInsets() {
+  const [ins, setIns] = useState(() => Alarm.insets());
+  useEffect(() => {
+    const upd = () => { const n = Alarm.insets(); setIns((p) => (p.top === n.top && p.bottom === n.bottom && p.left === n.left && p.right === n.right ? p : n)); };
+    upd();
+    const t1 = setTimeout(upd, 250), t2 = setTimeout(upd, 900), t3 = setTimeout(upd, 2500);
+    const a = AppState.addEventListener('change', (st) => st === 'active' && upd());
+    const d = Dimensions.addEventListener('change', upd);
+    return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); a.remove(); d.remove(); };
+  }, []);
+  return ins;
+}
+
 export default function App() {
+  const ins = useNativeInsets();
+  return <InsetsCtx.Provider value={ins}><Root /></InsetsCtx.Provider>;
+}
+
+function Root() {
+  const ins = useInsets();
   const [phase, setPhase] = useState('boot'); // boot | login | main
   const [cfg, setCfg] = useState({ url: '', key: '', email: '' });
   const [tab, setTab] = useState('today');
   const [habits, setHabits] = useState([]);
   const [decisions, setDecisions] = useState([]);
   const [snoozes, setSn] = useState({});
+  const [resets, setResets] = useState({});
   const [offline, setOffline] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [editing, setEditing] = useState(null);
@@ -43,9 +68,10 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try { await flushOutbox(); } catch {}
-    const [h, d, s] = await Promise.all([loadHabits(), loadDecisions(), getSnoozes()]);
-    setHabits(h.habits); setDecisions(d.decisions); setSn(s); setOffline(h.offline || d.offline);
-    try { Alarm.rescheduleAll(h.habits, d.decisions, s); } catch {}
+    try { const { data } = await db().auth.getSession(); if (data?.session) Alarm.setToken(data.session.access_token, (data.session.expires_at || 0) * 1000); } catch {}
+    const [h, d, s, rs] = await Promise.all([loadHabits(), loadDecisions(), getSnoozes(), getResets()]);
+    setHabits(h.habits); setDecisions(d.decisions); setSn(s); setResets(rs); setOffline(h.offline || d.offline);
+    try { Alarm.rescheduleAll(h.habits, d.decisions, s, rs); } catch {}
     return h.habits;
   }, []);
 
@@ -68,14 +94,18 @@ export default function App() {
     const ack = [];
     for (const it of items) {
       const habit = list.find((h) => h.id === it.habitId);
-      if (habit) {
-        const when = new Date(it.ts);
-        await submitDecision({
-          id: it.id, habit_id: habit.id, habit_name: habit.name, decision: it.decision,
-          message: buildMessage(habit, it.decision, when), chat_url: habit.chat_url, decided_at: when.toISOString(),
-        });
-        if (it.decision === 'snoozed') sn[habit.id] = it.ts + (habit.snooze_minutes || 15) * 60000; else delete sn[habit.id];
-        toast(it.decision === 'snoozed' ? `Snoozed ${habit.name}` : 'Saved. Your laptop will send it to ChatGPT.');
+      const when = new Date(it.ts);
+      const snz = (habit && habit.snooze_minutes) || 15;
+      if (habit || it.chatUrl) {
+        // already stored in Supabase by the alarm screen (it.up): skip upload. Otherwise upload now (idempotent id).
+        if (!it.up) {
+          await submitDecision({
+            id: it.id, habit_id: it.habitId, habit_name: habit ? habit.name : it.habitName, decision: it.decision,
+            message: it.message || buildMessage(habit, it.decision, when), chat_url: (habit && habit.chat_url) || it.chatUrl, decided_at: when.toISOString(),
+          });
+          toast(it.decision === 'snoozed' ? `Snoozed ${it.habitName}` : 'Saved. Your laptop will send it to ChatGPT.');
+        }
+        if (it.decision === 'snoozed') sn[it.habitId] = it.ts + snz * 60000; else delete sn[it.habitId];
       }
       ack.push(it.id);
     }
@@ -138,6 +168,42 @@ export default function App() {
     return () => { app.remove(); clearInterval(timer); started.current = false; };
   }, [phase, refresh, flushNative, refreshDecisions]);
 
+  const removeHabit = useCallback((h) => {
+    Alert.alert(`Delete “${h.name}”?`, 'Its alarms stop and it disappears from Streaks.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Delete', style: 'destructive', onPress: async () => {
+        try {
+          await deleteHabit(h.id);
+          Alarm.stop(h.id);
+          const sn = await getSnoozes(); delete sn[h.id]; await setSnoozes(sn);
+          toast('Habit deleted');
+          await refresh();
+        } catch (e) { Alert.alert('Could not delete', e.message || String(e)); }
+      } },
+    ]);
+  }, [refresh]);
+
+  const undoToday = useCallback((h) => {
+    Alert.alert(`Remove today's answer for “${h.name}”?`, 'It is removed from Streaks. If your laptop has not sent it yet, it will not be sent.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Remove', style: 'destructive', onPress: async () => {
+        try {
+          const st = new Date(); st.setHours(0, 0, 0, 0);
+          const en = new Date(st); en.setDate(en.getDate() + 1);
+          const inDay = (ms) => ms >= +st && ms < +en;
+          const had = decisions.filter((d) => d.habit_id === h.id && d.status !== 'queued' && inDay(new Date(d.decided_at).getTime())).length;
+          const n = await deleteDecisionsDay(h.id, +st, +en);
+          if (had && !n) throw new Error('The database blocked the delete. Run the delete-policy SQL once in Supabase (see chat).');
+          Alarm.ackPending(Alarm.getPending().filter((x) => x.habitId === h.id && inDay(x.ts)).map((x) => x.id));
+          const sn = await getSnoozes(); delete sn[h.id]; await setSnoozes(sn);
+          Alarm.stop(h.id);
+          toast("Today's answer removed");
+          await refresh();
+        } catch (e) { Alert.alert('Could not remove', e.message || String(e)); }
+      } },
+    ]);
+  }, [decisions, refresh]);
+
   const onRefresh = async () => { setRefreshing(true); await refresh(); setRefreshing(false); };
 
   if (phase === 'boot') return <View style={[s.fill, s.center]}><ActivityIndicator size="large" color={C.primary} /></View>;
@@ -147,28 +213,39 @@ export default function App() {
   return (
     <View style={s.fill}>
       <StatusBar style="dark" />
-      <View style={s.header}>
-        <View style={s.logo}><Icon name="alarm" size={20} color="#fff" /></View>
-        <Text style={s.title}>Nudge</Text>
+      <View style={[s.header, { paddingTop: ins.top + 10 }]}>
+        {tab === 'streaks' ? (
+          <TouchableOpacity style={s.backBtn} onPress={() => setTab('today')} activeOpacity={0.7}><Icon name="chevron-back" size={22} color={C.ink} /></TouchableOpacity>
+        ) : (
+          <View style={s.logo}><Icon name="alarm" size={20} color="#fff" /></View>
+        )}
+        <Text style={s.title}>{tab === 'streaks' ? 'Streaks' : 'Nudge'}</Text>
+        <View style={{ flex: 1 }} />
+        {tab !== 'streaks' && (
+          <TouchableOpacity style={s.flameBtn} onPress={() => setTab('streaks')} activeOpacity={0.8}>
+            <Icon name="flame" size={17} color={C.flame} /><Text style={s.flameTxt}>Streaks</Text>
+          </TouchableOpacity>
+        )}
         {offline && <View style={s.offPill}><Icon name="cloud-offline-outline" size={13} color={C.red} /><Text style={s.offTxt}>offline</Text></View>}
       </View>
       <ScrollView
-        style={s.fill} contentContainerStyle={{ padding: 16, paddingBottom: 130 }}
+        style={s.fill} contentContainerStyle={{ padding: 16, paddingBottom: 110 + ins.bottom }}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[C.primary]} />}
         keyboardShouldPersistTaps="handled"
       >
-        {tab === 'today' && <Today habits={habits} decisions={decisions} snoozes={snoozes} onDecide={decide} tick={tick} goHabits={() => setTab('habits')} />}
-        {tab === 'habits' && <Habits habits={habits} onEdit={setEditing} />}
+        {tab === 'today' && <Today habits={habits} decisions={decisions} snoozes={snoozes} resets={resets} onDecide={decide} onDelete={removeHabit} onUndo={undoToday} tick={tick} goHabits={() => setTab('habits')} />}
+        {tab === 'streaks' && <Streaks habits={habits} decisions={decisions} />}
+        {tab === 'habits' && <Habits habits={habits} onEdit={setEditing} onDelete={removeHabit} />}
         {tab === 'history' && <History decisions={decisions} habits={habits} onRetry={async (id) => { try { await retryNow(id); onRefresh(); } catch (e) { Alert.alert('Error', e.message); } }} />}
         {tab === 'settings' && <Settings cfg={cfg} offline={offline} onRefresh={onRefresh}
-          onSignOut={async () => { await db().auth.signOut(); Alarm.rescheduleAll([], [], {}); started.current = false; setPhase('login'); }} />}
+          onSignOut={async () => { Alarm.setAuth('', '', '', ''); await db().auth.signOut(); Alarm.rescheduleAll([], [], {}); started.current = false; setPhase('login'); }} />}
       </ScrollView>
       {tab === 'habits' && (
-        <TouchableOpacity style={s.fab} activeOpacity={0.85} onPress={() => setEditing({ ...EMPTY })}>
+        <TouchableOpacity style={[s.fab, { bottom: 80 + ins.bottom }]} activeOpacity={0.85} onPress={() => setEditing({ ...EMPTY })}>
           <Icon name="add" size={22} color="#fff" /><Text style={s.fabTxt}>New habit</Text>
         </TouchableOpacity>
       )}
-      <View style={s.tabs}>
+      <View style={[s.tabs, { paddingBottom: 10 + ins.bottom }]}>
         {TABS.map(([k, ic, l]) => (
           <TouchableOpacity key={k} style={s.tab} onPress={() => setTab(k)} activeOpacity={0.7}>
             <Icon name={tab === k ? ic : `${ic}-outline`} size={23} color={tab === k ? C.primary : '#9A9AB5'} />
@@ -176,13 +253,23 @@ export default function App() {
           </TouchableOpacity>
         ))}
       </View>
-      {editing && <HabitEditor habit={editing} onClose={() => setEditing(null)} onSaved={async () => { setEditing(null); await refresh(); }} />}
+      {editing && <HabitEditor habit={editing} onClose={() => setEditing(null)} onSaved={async (info) => {
+        setEditing(null);
+        if (info && info.id) {
+          // new time = fresh alarm: stop any running/snoozed chain and forget "already answered today"
+          Alarm.stop(info.id);
+          const sn = await getSnoozes(); delete sn[info.id]; await setSnoozes(sn);
+          if (info.timeChanged) await setReset(info.id, Date.now());
+        }
+        await refresh();
+      }} />}
     </View>
   );
 }
 
 // ------------------------------------------------------------------ Login
 function Login({ cfg, onDone }) {
+  const ins = useInsets();
   const [url, setUrl] = useState(cfg.url || '');
   const [key, setKey] = useState(cfg.key || '');
   const [email, setEmail] = useState(cfg.email || '');
@@ -199,6 +286,7 @@ function Login({ cfg, onDone }) {
       const client = initClient(url, key);
       const { error } = await client.auth.signInWithPassword({ email: email.trim(), password: pw });
       if (error) throw error;
+      Alarm.setAuth(url.trim(), key.trim(), email.trim(), pw);
       const c = { url: url.trim(), key: key.trim(), email: email.trim() };
       await AsyncStorage.setItem('nudge.cfg', JSON.stringify(c));
       onDone(c);
@@ -209,7 +297,7 @@ function Login({ cfg, onDone }) {
   return (
     <KeyboardAvoidingView style={s.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
       <StatusBar style="dark" />
-      <ScrollView contentContainerStyle={{ padding: 24, paddingTop: 80 }} keyboardShouldPersistTaps="handled">
+      <ScrollView contentContainerStyle={{ padding: 24, paddingTop: ins.top + 48, paddingBottom: ins.bottom + 24 }} keyboardShouldPersistTaps="handled">
         <View style={[s.logo, { width: 64, height: 64, borderRadius: 20 }]}><Icon name="alarm" size={32} color="#fff" /></View>
         <Text style={[s.title, { fontSize: 32, marginTop: 16 }]}>Nudge</Text>
         <Text style={{ color: C.sub, marginBottom: 24, marginTop: 4 }}>Connect to your Supabase project (one time).</Text>
@@ -232,7 +320,7 @@ const DELIVERY = {
   queued: { t: 'Queued on phone', icon: 'cloud-upload-outline', bg: C.redSoft, fg: C.red },
 };
 
-function Today({ habits, decisions, snoozes, onDecide, goHabits }) {
+function Today({ habits, decisions, snoozes, resets, onDecide, onDelete, onUndo, goHabits }) {
   const now = new Date();
   const today = dayKey(now);
   const active = habits.filter((h) => h.enabled);
@@ -247,13 +335,15 @@ function Today({ habits, decisions, snoozes, onDecide, goHabits }) {
         </Card>
       )}
       {active.map((h) => {
-        const todays = decisions.filter((d) => d.habit_id === h.id && dayKey(new Date(d.decided_at)) === today);
+        const rs = (resets && resets[h.id]) || 0;
+        const todays = decisions.filter((d) => d.habit_id === h.id && dayKey(new Date(d.decided_at)) === today && new Date(d.decided_at).getTime() > rs);
         const final = todays.find((d) => d.decision !== 'snoozed');
         const [hh, mm] = h.remind_time.split(':').map(Number);
         const due = new Date(); due.setHours(hh, mm, 0, 0);
         const sn = snoozes[h.id] && snoozes[h.id] > Date.now() ? snoozes[h.id] : null;
         let chip = { t: `Reminds at ${fmtHHMM(h.remind_time)}`, bg: C.primarySoft, fg: C.primary, icon: 'alarm-outline' };
         if (final?.decision === 'going') chip = { t: 'Going', bg: C.greenSoft, fg: C.green, icon: 'checkmark-circle' };
+        else if (final?.decision === 'custom') chip = { t: 'Answered', bg: C.primarySoft, fg: C.primary, icon: 'chatbubble-ellipses' };
         else if (final) chip = { t: 'Skipped today', bg: C.redSoft, fg: C.red, icon: 'close-circle' };
         else if (sn) chip = { t: `Snoozed until ${timeOnly(new Date(sn))}`, bg: C.amberSoft, fg: C.amber, icon: 'time-outline' };
         else if (now >= due) chip = { t: 'Due now', bg: C.amberSoft, fg: C.amber, icon: 'notifications' };
@@ -266,11 +356,15 @@ function Today({ habits, decisions, snoozes, onDecide, goHabits }) {
                 <Text style={s.cardTitle}>{h.name}</Text>
                 <Chip {...chip} />
               </View>
+              <TouchableOpacity onPress={() => onDelete(h)} style={s.trash} activeOpacity={0.7} hitSlop={8}><Icon name="trash-outline" size={19} color={C.red} /></TouchableOpacity>
             </View>
             {final ? (
               <View>
                 <Text style={s.msg}>“{final.message}”</Text>
-                {dv && <View style={{ marginTop: 10 }}><Chip {...dv} /></View>}
+                <View style={[s.row, { marginTop: 10, justifyContent: 'space-between' }]}>
+                  {dv ? <Chip {...dv} /> : <View />}
+                  <TouchableOpacity onPress={() => onUndo(h)} hitSlop={8}><Text style={{ color: C.red, fontWeight: '700', fontSize: 13 }}>Remove today's answer</Text></TouchableOpacity>
+                </View>
               </View>
             ) : (
               <View style={{ marginTop: 14, gap: 10 }}>
@@ -288,7 +382,7 @@ function Today({ habits, decisions, snoozes, onDecide, goHabits }) {
 
 // ------------------------------------------------------------------ Habits
 const fmtEvery = (sec) => (sec % 60 === 0 ? `${sec / 60} min` : `${sec}s`);
-function Habits({ habits, onEdit }) {
+function Habits({ habits, onEdit, onDelete }) {
   return (
     <View>
       <Text style={s.kicker}>MANAGE</Text>
@@ -304,6 +398,7 @@ function Habits({ habits, onEdit }) {
                 <Text style={s.sub}>{fmtHHMM(h.remind_time)} · repeats every {fmtEvery(h.repeat_seconds)} · snooze {h.snooze_minutes} min</Text>
               </View>
               <Chip t={h.enabled ? 'On' : 'Paused'} bg={h.enabled ? C.greenSoft : C.line} fg={h.enabled ? C.green : C.sub} />
+              <TouchableOpacity onPress={() => onDelete(h)} style={s.trash} activeOpacity={0.7} hitSlop={8}><Icon name="trash-outline" size={19} color={C.red} /></TouchableOpacity>
             </View>
             <View style={[s.row, { marginTop: 10 }]}>
               <Icon name="chatbubble-ellipses-outline" size={15} color={C.sub} />
@@ -321,10 +416,12 @@ const DEC = {
   going: { icon: 'checkmark-circle', color: C.green },
   not_going: { icon: 'close-circle', color: C.red },
   snoozed: { icon: 'time', color: C.amber },
-};
+  custom: { icon: 'chatbubble-ellipses', color: C.primary },
+};;
 function History({ decisions, habits, onRetry }) {
   const [filter, setFilter] = useState('all');
-  const list = decisions.filter((d) => filter === 'all' || d.habit_id === filter);
+  const all = decisions.filter((d) => filter === 'all' || d.habit_id === filter);
+  const list = all.slice(0, 150);
   const n = (k) => list.filter((d) => d.decision === k).length;
   return (
     <View>
@@ -364,6 +461,155 @@ function History({ decisions, habits, onRetry }) {
           </Card>
         );
       })}
+    </View>
+  );
+}
+
+// ------------------------------------------------------------------ Streaks
+const WD = ['M', 'T', 'W', 'T', 'F', 'S', 'S'];
+const MON = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const MONTH_FULL = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+const parseKey = (k) => { const [y, m, d] = k.split('-').map(Number); return new Date(y, m - 1, d); };
+
+// day -> 'done' | 'skip'. The LAST going / not-going answer of a day wins. Snoozes and typed answers don't count.
+function dayMap(habitId, decisions) {
+  const map = {}, at = {};
+  for (const d of decisions) {
+    if (d.habit_id !== habitId || d.decision === 'snoozed' || d.decision === 'custom') continue;
+    const t = new Date(d.decided_at).getTime();
+    const k = dayKey(new Date(t));
+    if (!at[k] || t > at[k]) { at[k] = t; map[k] = d.decision === 'going' ? 'done' : 'skip'; }
+  }
+  return map;
+}
+
+function streakStats(map) {
+  const keys = Object.keys(map).sort();
+  let completed = 0, skipped = 0, longest = 0, run = 0, prev = null;
+  for (const k of keys) {
+    if (map[k] === 'done') completed++; else skipped++;
+    if (map[k] !== 'done') { run = 0; prev = null; continue; }
+    const dt = parseKey(k);
+    run = prev && Math.round((dt - prev) / 86400000) === 1 ? run + 1 : 1;
+    prev = dt;
+    longest = Math.max(longest, run);
+  }
+  let current = 0;
+  const d = new Date(); d.setHours(0, 0, 0, 0);
+  const tk = dayKey(d);
+  if (map[tk] !== 'skip') {
+    if (map[tk] !== 'done') d.setDate(d.getDate() - 1); // today not answered yet: streak is still alive through yesterday
+    while (map[dayKey(d)] === 'done') { current++; d.setDate(d.getDate() - 1); }
+  }
+  return { current, longest, completed, skipped };
+}
+
+const Tile = ({ n, l, color }) => (
+  <View style={s.tile}><Text style={[s.tileN, color && { color }]}>{n}</Text><Text style={s.tileL}>{l}</Text></View>
+);
+
+function DayDot({ d, state, isToday, future, size, showLabel }) {
+  const bg = state === 'done' ? C.green : state === 'skip' ? C.redSoft : 'transparent';
+  const fg = state === 'done' ? '#fff' : state === 'skip' ? C.red : future ? '#C9C9DA' : C.sub;
+  return (
+    <View style={{ alignItems: 'center' }}>
+      <View style={[s.day, { width: size, height: size, borderRadius: size / 2, backgroundColor: bg }, isToday && { borderWidth: 2, borderColor: C.primary }]}>
+        {showLabel && state
+          ? <Icon name={state === 'done' ? 'checkmark' : 'close'} size={size * 0.5} color={fg} />
+          : <Text style={{ color: fg, fontWeight: '700', fontSize: 13 }}>{d.getDate()}</Text>}
+      </View>
+      {showLabel && <Text style={{ color: C.sub, fontSize: 11, marginTop: 4, fontWeight: '600' }}>{d.getDate()}</Text>}
+    </View>
+  );
+}
+
+function Streaks({ habits, decisions }) {
+  const [mode, setMode] = useState('week');
+  const [off, setOff] = useState(0);
+  const now = new Date(); now.setHours(0, 0, 0, 0);
+  const todayK = dayKey(now);
+
+  const rows = habits.map((h) => { const map = dayMap(h.id, decisions); return { h, map, st: streakStats(map) }; });
+  const best = rows.reduce((m, r) => Math.max(m, r.st.current), 0);
+  const total = rows.reduce((m, r) => m + r.st.completed, 0);
+
+  let cells = [], title = '';
+  if (mode === 'week') {
+    const mon = new Date(now); mon.setDate(mon.getDate() - ((mon.getDay() + 6) % 7) - off * 7);
+    cells = Array.from({ length: 7 }, (_, i) => { const d = new Date(mon); d.setDate(mon.getDate() + i); return d; });
+    title = `${cells[0].getDate()} ${MON[cells[0].getMonth()]} – ${cells[6].getDate()} ${MON[cells[6].getMonth()]}`;
+  } else {
+    const first = new Date(now.getFullYear(), now.getMonth() - off, 1);
+    const n = new Date(first.getFullYear(), first.getMonth() + 1, 0).getDate();
+    cells = [...Array((first.getDay() + 6) % 7).fill(null), ...Array.from({ length: n }, (_, i) => new Date(first.getFullYear(), first.getMonth(), i + 1))];
+    while (cells.length % 7) cells.push(null);
+    title = `${MONTH_FULL[first.getMonth()]} ${first.getFullYear()}`;
+  }
+  const weeks = []; for (let i = 0; i < cells.length; i += 7) weeks.push(cells.slice(i, i + 7));
+  const isWeek = mode === 'week';
+
+  return (
+    <View>
+      <Text style={s.kicker}>PROGRESS</Text>
+      <Text style={s.h1}>Your streaks</Text>
+
+      <View style={s.hero}>
+        <View style={{ flex: 1 }}>
+          <Text style={s.heroL}>BEST CURRENT STREAK</Text>
+          <Text style={s.heroN}>{best} <Text style={{ fontSize: 16, fontWeight: '700' }}>{best === 1 ? 'day' : 'days'}</Text></Text>
+        </View>
+        <View style={s.heroSide}><Text style={s.heroSideN}>{total}</Text><Text style={s.heroSideL}>completed</Text></View>
+        <Icon name="flame" size={44} color="#FFD9A8" />
+      </View>
+
+      <View style={s.seg}>
+        {[['week', 'Week'], ['month', 'Month']].map(([k, l]) => (
+          <TouchableOpacity key={k} style={[s.segBtn, mode === k && s.segOn]} onPress={() => { setMode(k); setOff(0); }} activeOpacity={0.8}>
+            <Text style={{ fontWeight: '800', color: mode === k ? C.primary : C.sub }}>{l}</Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+      <View style={[s.row, { justifyContent: 'space-between', marginBottom: 6 }]}>
+        <TouchableOpacity style={s.nav} onPress={() => setOff(off + 1)} activeOpacity={0.7}><Icon name="chevron-back" size={20} /></TouchableOpacity>
+        <Text style={{ fontWeight: '800', color: C.ink, fontSize: 15 }}>{title}</Text>
+        <TouchableOpacity style={[s.nav, off === 0 && { opacity: 0.3 }]} disabled={off === 0} onPress={() => setOff(off - 1)} activeOpacity={0.7}><Icon name="chevron-forward" size={20} /></TouchableOpacity>
+      </View>
+      <View style={[s.row, { gap: 14, marginBottom: 12, justifyContent: 'center' }]}>
+        <View style={s.row}><View style={[s.legend, { backgroundColor: C.green }]} /><Text style={s.sub}>Completed</Text></View>
+        <View style={s.row}><View style={[s.legend, { backgroundColor: C.redSoft, borderWidth: 1, borderColor: C.red }]} /><Text style={s.sub}>Skipped</Text></View>
+        <View style={s.row}><View style={[s.legend, { borderWidth: 2, borderColor: C.primary }]} /><Text style={s.sub}>Today</Text></View>
+      </View>
+
+      {rows.length === 0 && <Card><Text style={{ color: C.sub }}>No habits yet. Add one in the Habits tab.</Text></Card>}
+      {rows.map(({ h, map, st }) => (
+        <Card key={h.id}>
+          <View style={s.row}>
+            <View style={s.iconCircle}><Icon name={iconFor(h)} size={22} color={C.primary} /></View>
+            <View style={{ flex: 1 }}>
+              <Text style={s.cardTitle}>{h.name}</Text>
+              <Text style={[s.sub, { marginTop: 0 }]}>{st.current > 0 ? `${st.current}-day streak going` : 'No active streak'}</Text>
+            </View>
+            <View style={s.flameChip}><Icon name="flame" size={18} color={C.flame} /><Text style={s.flameNum}>{st.current}</Text></View>
+          </View>
+          <View style={[s.row, { marginTop: 14, gap: 8 }]}>
+            <Tile n={st.longest} l="Longest" color={C.flame} />
+            <Tile n={st.completed} l="Completed" color={C.green} />
+            <Tile n={st.skipped} l="Skipped" color={C.red} />
+          </View>
+          <View style={{ marginTop: 16 }}>
+            <View style={s.calRow}>{WD.map((w, i) => <Text key={i} style={s.calWd}>{w}</Text>)}</View>
+            {weeks.map((wk, wi) => (
+              <View key={wi} style={[s.calRow, { marginTop: isWeek ? 4 : 6 }]}>
+                {wk.map((d, i) => (
+                  <View key={i} style={s.calCell}>
+                    {d && <DayDot d={d} state={map[dayKey(d)]} isToday={dayKey(d) === todayK} future={d > now} size={isWeek ? 38 : 34} showLabel={isWeek} />}
+                  </View>
+                ))}
+              </View>
+            ))}
+          </View>
+        </Card>
+      ))}
     </View>
   );
 }
@@ -438,6 +684,7 @@ function Settings({ cfg, offline, onSignOut, onRefresh }) {
 
 // ------------------------------------------------------------------ Habit editor
 function HabitEditor({ habit, onClose, onSaved }) {
+  const ins = useInsets();
   const [h, setH] = useState(habit);
   const [busy, setBusy] = useState(false);
   const initial = presetFor(habit)?.key || (habit.id ? 'custom' : 'walk');
@@ -476,19 +723,19 @@ function HabitEditor({ habit, onClose, onSaved }) {
     setBusy(true);
     try {
       await saveHabit({ ...h, activity, name: h.name.trim(), chat_url: h.chat_url.trim(), repeat_seconds: rep, snooze_minutes: snz });
-      onSaved();
+      onSaved({ id: h.id, timeChanged: !!h.id && h.remind_time !== habit.remind_time });
     } catch (e) { Alert.alert('Could not save', e.message); setBusy(false); }
   };
 
   const del = () => Alert.alert('Delete habit?', 'History stays, alarms stop.', [
     { text: 'Cancel', style: 'cancel' },
-    { text: 'Delete', style: 'destructive', onPress: async () => { try { await deleteHabit(h.id); onSaved(); } catch (e) { Alert.alert('Error', e.message); } } },
+    { text: 'Delete', style: 'destructive', onPress: async () => { try { await deleteHabit(h.id); onSaved({ id: h.id }); } catch (e) { Alert.alert('Error', e.message); } } },
   ]);
 
   return (
-    <Modal animationType="slide" onRequestClose={onClose}>
+    <Modal animationType="slide" onRequestClose={onClose} statusBarTranslucent navigationBarTranslucent>
       <KeyboardAvoidingView style={s.fill} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView contentContainerStyle={{ padding: 20, paddingTop: 48 }} keyboardShouldPersistTaps="handled">
+        <ScrollView contentContainerStyle={{ padding: 20, paddingTop: ins.top + 24, paddingBottom: ins.bottom + 32 }} keyboardShouldPersistTaps="handled">
           <Text style={s.kicker}>{h.id ? 'EDIT' : 'NEW'}</Text>
           <Text style={s.h1}>{h.id ? 'Edit habit' : 'New habit'}</Text>
 
@@ -577,8 +824,32 @@ const s = StyleSheet.create({
   input: { backgroundColor: C.card, borderWidth: 1, borderColor: C.line, borderRadius: 14, paddingHorizontal: 14, paddingVertical: 13, fontSize: 16, color: C.ink },
   btn: { flexDirection: 'row', gap: 8, borderRadius: 16, paddingVertical: 15, alignItems: 'center', justifyContent: 'center' },
   btnTxt: { color: '#fff', fontWeight: '800', fontSize: 15, letterSpacing: 0.4 },
-  tabs: { position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', backgroundColor: C.card, borderTopWidth: 1, borderColor: C.line, paddingBottom: 14, paddingTop: 9 },
+  tabs: { position: 'absolute', bottom: 0, left: 0, right: 0, flexDirection: 'row', backgroundColor: C.card, borderTopWidth: 1, borderColor: C.line, paddingTop: 9 },
   tab: { flex: 1, alignItems: 'center', gap: 2 }, tabTxt: { fontSize: 11, color: '#9A9AB5', fontWeight: '600' },
+  backBtn: { width: 36, height: 36, borderRadius: 11, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center', ...shadow },
+  flameBtn: { flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: C.flameSoft, borderRadius: 16, paddingHorizontal: 12, paddingVertical: 7 },
+  flameTxt: { color: C.flame, fontWeight: '800', fontSize: 13 },
+  trash: { width: 36, height: 36, borderRadius: 12, backgroundColor: C.redSoft, alignItems: 'center', justifyContent: 'center' },
+  hero: { flexDirection: 'row', alignItems: 'center', gap: 14, backgroundColor: C.primary, borderRadius: 24, padding: 20, marginBottom: 16, ...shadow },
+  heroL: { color: '#C9C9F5', fontSize: 11, fontWeight: '800', letterSpacing: 1.2 },
+  heroN: { color: '#fff', fontSize: 40, fontWeight: '800', letterSpacing: -1, marginTop: 2 },
+  heroSide: { alignItems: 'center', paddingHorizontal: 12, borderLeftWidth: 1, borderLeftColor: 'rgba(255,255,255,0.25)' },
+  heroSideN: { color: '#fff', fontSize: 22, fontWeight: '800' },
+  heroSideL: { color: '#C9C9F5', fontSize: 11, fontWeight: '600' },
+  seg: { flexDirection: 'row', backgroundColor: '#E8E8F3', borderRadius: 14, padding: 4, marginBottom: 12 },
+  segBtn: { flex: 1, alignItems: 'center', paddingVertical: 9, borderRadius: 11 },
+  segOn: { backgroundColor: C.card, ...shadow },
+  nav: { width: 36, height: 36, borderRadius: 12, backgroundColor: C.card, alignItems: 'center', justifyContent: 'center' },
+  legend: { width: 12, height: 12, borderRadius: 6 },
+  flameChip: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: C.flameSoft, borderRadius: 14, paddingHorizontal: 12, paddingVertical: 7 },
+  flameNum: { color: C.flame, fontWeight: '800', fontSize: 20 },
+  tile: { flex: 1, backgroundColor: C.bg, borderRadius: 16, paddingVertical: 12, alignItems: 'center' },
+  tileN: { fontSize: 24, fontWeight: '800', color: C.ink },
+  tileL: { fontSize: 12, color: C.sub, fontWeight: '600', marginTop: 2 },
+  calRow: { flexDirection: 'row' },
+  calWd: { flex: 1, textAlign: 'center', color: C.sub, fontSize: 11, fontWeight: '800', marginBottom: 2 },
+  calCell: { flex: 1, alignItems: 'center', justifyContent: 'center' },
+  day: { alignItems: 'center', justifyContent: 'center' },
   fab: { position: 'absolute', right: 16, bottom: 92, flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: C.primary, borderRadius: 30, paddingHorizontal: 20, paddingVertical: 14, elevation: 5 },
   fabTxt: { color: '#fff', fontWeight: '800' },
 });
