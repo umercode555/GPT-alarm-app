@@ -15,8 +15,13 @@ import {
   saveHabit, setReset, setSnoozes, submitDecision,
 } from './src/data';
 import * as Alarm from './src/alarm';
+import { activeOf, loadLocalSessions, openRun, pullSessions, sessionsOf, totalOf } from './src/sessions';
+import { SessionModal } from './src/SessionUI';
+import { FoodModal, NutSettingsModal, NutritionTab } from './src/NutritionUI';
+import { NUT_ACT, addEntry, alarmArgs, confirmDay, endDay, entriesOf, loadLocalNut, maybeSendSummary, openDay, pullNut, removeEntry, saveNutSettings, startDay, syncPhotos, updateEntry } from './src/nutrition';
+import { syncInfo } from './src/sync';
 import { PRESETS, iconFor, presetFor } from './src/presets';
-import { buildMessage, dayKey, fmtHHMM, formatDateLong, formatStamp, timeOnly, uuid } from './src/time';
+import { buildMessage, dayKey, fmtDurLong, fmtHHMM, formatDateLong, formatStamp, timeOnly, uuid } from './src/time';
 
 const C = {
   bg: '#F5F5FB', card: '#FFFFFF', ink: '#15152B', sub: '#6E6E8A', line: '#E8E8F3',
@@ -24,6 +29,7 @@ const C = {
   green: '#16A068', greenSoft: '#E1F6EC', red: '#DB4B4B', redSoft: '#FCE9E9', amber: '#C77D0A', amberSoft: '#FFF2D9', flame: '#F97316', flameSoft: '#FFEDD9',
 };
 const EMPTY = { name: 'Walk', activity: 'going for a walk', remind_time: '22:00', repeat_seconds: 300, snooze_minutes: 15, chat_url: '', enabled: true };
+const WAIT = "Okay, I'm waiting for you. Go do it and start your session when you're ready.";
 const toast = (m) => { if (Platform.OS === 'android') ToastAndroid.show(m, ToastAndroid.LONG); };
 const Icon = ({ name, size = 20, color = C.ink }) => <Ionicons name={name} size={size} color={color} />;
 
@@ -62,6 +68,13 @@ function Root() {
   const [refreshing, setRefreshing] = useState(false);
   const [editing, setEditing] = useState(null);
   const [tick, setTick] = useState(0);
+  const [nut, setNut] = useState({ settings: null, days: [], entries: [], photos: {} });
+  const [runs, setRuns] = useState([]);
+  const [sessions, setSessions] = useState([]);
+  const [nutHabitId, setNutHabitId] = useState(null);
+  const [sessionHabit, setSessionHabit] = useState(null);
+  const [foodEditor, setFoodEditor] = useState(null);
+  const [nutSettingsOpen, setNutSettingsOpen] = useState(false);
   const lastPress = useRef({});
   const started = useRef(false);
   const seen = useRef({});
@@ -69,11 +82,31 @@ function Root() {
   const refresh = useCallback(async () => {
     try { await flushOutbox(); } catch {}
     try { const { data } = await db().auth.getSession(); if (data?.session) Alarm.setToken(data.session.access_token, (data.session.expires_at || 0) * 1000); } catch {}
-    const [h, d, s, rs] = await Promise.all([loadHabits(), loadDecisions(), getSnoozes(), getResets()]);
-    setHabits(h.habits); setDecisions(d.decisions); setSn(s); setResets(rs); setOffline(h.offline || d.offline);
-    try { Alarm.rescheduleAll(h.habits, d.decisions, s, rs); } catch {}
-    return h.habits;
+    const [h, d, s, rs, n, ss] = await Promise.all([loadHabits(), loadDecisions(), getSnoozes(), getResets(), pullNut(), pullSessions()]);
+    const nh = h.habits.find((x) => x.activity === NUT_ACT);
+    const real = h.habits.filter((x) => x.activity !== NUT_ACT);
+    setHabits(real); setDecisions(d.decisions); setSn(s); setResets(rs); setOffline(h.offline || d.offline);
+    setNut(n); setRuns(ss.runs); setSessions(ss.sessions); setNutHabitId(nh ? nh.id : null);
+    try { Alarm.rescheduleAll(real, d.decisions, s, rs, alarmArgs(n)); } catch {}
+    syncPhotos(n).catch(() => {});
+    return real;
   }, []);
+
+  // ~11:50 PM Nutrition Day summary (also runs when the app opens)
+  const checkSummary = useCallback(async () => {
+    try {
+      const cur = await loadLocalNut();
+      if (await maybeSendSummary(cur)) setNut(await loadLocalNut());
+    } catch {}
+  }, []);
+
+  const reloadSessions = useCallback(async () => { const x = await loadLocalSessions(); setRuns(x.runs); setSessions(x.sessions); }, []);
+  const reloadNut = useCallback(async () => {
+    const n = await loadLocalNut();
+    setNut(n);
+    try { Alarm.rescheduleAll(habits, decisions, snoozes, resets, alarmArgs(n)); } catch {}
+    return n;
+  }, [habits, decisions, snoozes, resets]);
 
   // light refresh (no re-scheduling): announces when a message was delivered to ChatGPT
   const refreshDecisions = useCallback(async () => {
@@ -94,6 +127,7 @@ function Root() {
     const ack = [];
     for (const it of items) {
       const habit = list.find((h) => h.id === it.habitId);
+      if ((habit && habit.activity === NUT_ACT) || String(it.habitId) === String(nutHabitId)) { ack.push(it.id); continue; }
       const when = new Date(it.ts);
       const snz = (habit && habit.snooze_minutes) || 15;
       if (habit || it.chatUrl) {
@@ -103,7 +137,7 @@ function Root() {
             id: it.id, habit_id: it.habitId, habit_name: habit ? habit.name : it.habitName, decision: it.decision,
             message: it.message || buildMessage(habit, it.decision, when), chat_url: (habit && habit.chat_url) || it.chatUrl, decided_at: when.toISOString(),
           });
-          toast(it.decision === 'snoozed' ? `Snoozed ${it.habitName}` : 'Saved. Your laptop will send it to ChatGPT.');
+          toast(it.decision === 'snoozed' ? `Snoozed ${it.habitName}` : it.decision === 'going' ? WAIT : 'Saved. Your laptop will send it to ChatGPT.');
         }
         if (it.decision === 'snoozed') sn[it.habitId] = it.ts + snz * 60000; else delete sn[it.habitId];
       }
@@ -112,7 +146,7 @@ function Root() {
     await setSnoozes(sn);
     Alarm.ackPending(ack);
     return true;
-  }, []);
+  }, [nutHabitId]);
 
   const decide = useCallback(async (habit, decision) => {
     const k = habit.id + decision;
@@ -131,7 +165,7 @@ function Root() {
     } else delete sn[habit.id];
     await setSnoozes(sn);
     toast(!sent ? 'Saved on your phone. It will upload when you are online.'
-      : decision === 'snoozed' ? `Snoozed ${habit.snooze_minutes || 15} min` : 'Saved. Your laptop will send it to ChatGPT.');
+      : decision === 'snoozed' ? `Snoozed ${habit.snooze_minutes || 15} min` : decision === 'going' ? WAIT : 'Saved. Your laptop will send it to ChatGPT.');
     await refresh();
   }, [refresh]);
 
@@ -155,18 +189,20 @@ function Root() {
       await Alarm.askNotificationPermission();
       await refresh();
       if (await flushNative()) await refresh();
+      checkSummary();
     })();
     const app = AppState.addEventListener('change', async (st) => {
       if (st === 'active') {
         db()?.auth.startAutoRefresh();
         await refresh();
         if (await flushNative()) await refresh();
+        checkSummary();
         setTick((t) => t + 1);
       } else db()?.auth.stopAutoRefresh();
     });
-    const timer = setInterval(() => { setTick((t) => t + 1); refreshDecisions(); }, 20000);
+    const timer = setInterval(() => { setTick((t) => t + 1); refreshDecisions(); checkSummary(); }, 20000);
     return () => { app.remove(); clearInterval(timer); started.current = false; };
-  }, [phase, refresh, flushNative, refreshDecisions]);
+  }, [phase, refresh, flushNative, refreshDecisions, checkSummary]);
 
   const removeHabit = useCallback((h) => {
     Alert.alert(`Delete “${h.name}”?`, 'Its alarms stop and it disappears from Streaks.', [
@@ -204,12 +240,46 @@ function Root() {
     ]);
   }, [decisions, refresh]);
 
+  // ---- nutrition actions ----
+  const saveFood = async (f) => {
+    const cur = await loadLocalNut();
+    if (foodEditor && foodEditor.id) await updateEntry(cur, foodEditor, f); else await addEntry(cur, f);
+    setFoodEditor(null);
+    toast(foodEditor && foodEditor.id ? 'Food updated' : 'Food saved');
+    await reloadNut();
+  };
+  const deleteFood = (e) => Alert.alert(`Delete “${e.name}”?`, 'It is removed from your history and ChatGPT gets a correction.', [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Delete', style: 'destructive', onPress: async () => { try { await removeEntry(await loadLocalNut(), e); toast('Food deleted'); await reloadNut(); } catch (x) { Alert.alert('Could not delete', x.message || String(x)); } } },
+  ]);
+  const toggleConfirm = async () => {
+    const cur = await loadLocalNut(); const day = openDay(cur.days); if (!day) return;
+    await confirmDay(day, !day.confirmed_at);
+    toast(day.confirmed_at ? 'Reminders back on' : 'Great. Reminders stopped for this Nutrition Day.');
+    const n = await reloadNut();
+    if (!day.confirmed_at) Alarm.stop(cur.settings && cur.settings.habit_id);
+    return n;
+  };
+  const newNutDay = () => Alert.alert('Start a new Nutrition Day?', 'The current day is closed and its full summary goes to ChatGPT.', [
+    { text: 'Cancel', style: 'cancel' },
+    { text: 'Start new day', onPress: async () => {
+      try { const cur = await loadLocalNut(); const day = openDay(cur.days); if (day) await endDay(cur, day); await startDay(new Date()); toast('New Nutrition Day started'); await reloadNut(); }
+      catch (x) { Alert.alert('Error', x.message || String(x)); }
+    } },
+  ]);
+  const saveNutCfg = async (form) => {
+    await saveNutSettings(nutHabitId, form);
+    setNutSettingsOpen(false);
+    toast('Nutrition settings saved');
+    await refresh();
+  };
+
   const onRefresh = async () => { setRefreshing(true); await refresh(); setRefreshing(false); };
 
   if (phase === 'boot') return <View style={[s.fill, s.center]}><ActivityIndicator size="large" color={C.primary} /></View>;
   if (phase === 'login') return <Login cfg={cfg} onDone={(c) => { setCfg(c); started.current = false; setPhase('main'); }} />;
 
-  const TABS = [['today', 'today', 'Today'], ['habits', 'list', 'Habits'], ['history', 'time', 'History'], ['settings', 'settings', 'Settings']];
+  const TABS = [['today', 'today', 'Today'], ['habits', 'list', 'Habits'], ['nutrition', 'restaurant', 'Food'], ['history', 'time', 'History'], ['settings', 'settings', 'Settings']];
   return (
     <View style={s.fill}>
       <StatusBar style="dark" />
@@ -233,9 +303,10 @@ function Root() {
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[C.primary]} />}
         keyboardShouldPersistTaps="handled"
       >
-        {tab === 'today' && <Today habits={habits} decisions={decisions} snoozes={snoozes} resets={resets} onDecide={decide} onDelete={removeHabit} onUndo={undoToday} tick={tick} goHabits={() => setTab('habits')} />}
+        {tab === 'today' && <Today habits={habits} decisions={decisions} snoozes={snoozes} resets={resets} runs={runs} sessions={sessions} onSession={setSessionHabit} onDecide={decide} onDelete={removeHabit} onUndo={undoToday} tick={tick} goHabits={() => setTab('habits')} />}
         {tab === 'streaks' && <Streaks habits={habits} decisions={decisions} />}
-        {tab === 'habits' && <Habits habits={habits} onEdit={setEditing} onDelete={removeHabit} />}
+        {tab === 'habits' && <Habits habits={habits} onEdit={setEditing} onDelete={removeHabit} onSession={setSessionHabit} />}
+        {tab === 'nutrition' && <NutritionTab nut={nut} onAdd={() => setFoodEditor({})} onEdit={setFoodEditor} onDelete={deleteFood} onSettings={() => setNutSettingsOpen(true)} onConfirm={toggleConfirm} onNewDay={newNutDay} />}
         {tab === 'history' && <History decisions={decisions} habits={habits} onRetry={async (id) => { try { await retryNow(id); onRefresh(); } catch (e) { Alert.alert('Error', e.message); } }} />}
         {tab === 'settings' && <Settings cfg={cfg} offline={offline} onRefresh={onRefresh}
           onSignOut={async () => { Alarm.setAuth('', '', '', ''); await db().auth.signOut(); Alarm.rescheduleAll([], [], {}); started.current = false; setPhase('login'); }} />}
@@ -243,6 +314,11 @@ function Root() {
       {tab === 'habits' && (
         <TouchableOpacity style={[s.fab, { bottom: 80 + ins.bottom }]} activeOpacity={0.85} onPress={() => setEditing({ ...EMPTY })}>
           <Icon name="add" size={22} color="#fff" /><Text style={s.fabTxt}>New habit</Text>
+        </TouchableOpacity>
+      )}
+      {tab === 'nutrition' && nut.settings && nut.settings.chat_url && (
+        <TouchableOpacity style={[s.fab, { bottom: 80 + ins.bottom }]} activeOpacity={0.85} onPress={() => setFoodEditor({})}>
+          <Icon name="add" size={22} color="#fff" /><Text style={s.fabTxt}>Add food</Text>
         </TouchableOpacity>
       )}
       <View style={[s.tabs, { paddingBottom: 10 + ins.bottom }]}>
@@ -263,6 +339,10 @@ function Root() {
         }
         await refresh();
       }} />}
+      {sessionHabit && <SessionModal habit={habits.find((x) => x.id === sessionHabit.id) || sessionHabit} runs={runs} sessions={sessions} ins={ins}
+        onClose={() => { setSessionHabit(null); refresh(); }} onChange={reloadSessions} toast={toast} />}
+      {foodEditor && <FoodModal entry={foodEditor} nut={nut} ins={ins} onClose={() => setFoodEditor(null)} onSave={saveFood} />}
+      {nutSettingsOpen && <NutSettingsModal settings={nut.settings} ins={ins} onClose={() => setNutSettingsOpen(false)} onSave={saveNutCfg} />}
     </View>
   );
 }
@@ -320,7 +400,7 @@ const DELIVERY = {
   queued: { t: 'Queued on phone', icon: 'cloud-upload-outline', bg: C.redSoft, fg: C.red },
 };
 
-function Today({ habits, decisions, snoozes, resets, onDecide, onDelete, onUndo, goHabits }) {
+function Today({ habits, decisions, snoozes, resets, runs, sessions, onSession, onDecide, onDelete, onUndo, goHabits }) {
   const now = new Date();
   const today = dayKey(now);
   const active = habits.filter((h) => h.enabled);
@@ -373,6 +453,7 @@ function Today({ habits, decisions, snoozes, resets, onDecide, onDelete, onUndo,
                 <Btn icon="time-outline" label={`SNOOZE ${h.snooze_minutes || 15} MIN`} color={C.amber} outline onPress={() => onDecide(h, 'snoozed')} />
               </View>
             )}
+            <SessionPanel h={h} runs={runs} sessions={sessions} final={final} onSession={onSession} />
           </Card>
         );
       })}
@@ -380,9 +461,47 @@ function Today({ habits, decisions, snoozes, resets, onDecide, onDelete, onUndo,
   );
 }
 
+// Start / continue / finish an activity session (Walk, Study, Work, Exercise, ...)
+function SessionPanel({ h, runs, sessions, final, onSession }) {
+  const hid = String(h.id);
+  const run = openRun(runs, hid);
+  const list = run ? sessionsOf(sessions, run.id) : [];
+  const active = activeOf(list);
+  const total = totalOf(list, Date.now());
+  const today = dayKey(new Date());
+  const doneToday = runs.filter((r) => r.habit_id === hid && r.status === 'finished' && r.finished_at && dayKey(new Date(r.finished_at)) === today);
+  const doneSec = doneToday.reduce((x, r) => x + (r.total_seconds || 0), 0);
+  const waiting = final && final.decision === 'going' && !run && !doneToday.length;
+  const box = { marginTop: 14, borderTopWidth: 1, borderTopColor: C.line, paddingTop: 14, gap: 10 };
+  if (active) return (
+    <View style={box}>
+      <Chip t="Session running" bg={C.greenSoft} fg={C.green} icon="radio-button-on" />
+      <Btn icon="timer-outline" label="OPEN SESSION" onPress={() => onSession(h)} />
+    </View>
+  );
+  if (run && list.length) return (
+    <View style={box}>
+      <Chip t={`Paused · ${fmtDurLong(total)} so far`} bg={C.amberSoft} fg={C.amber} icon="pause-circle" />
+      <Btn icon="play" label="CONTINUE / FINISH" onPress={() => onSession(h)} />
+    </View>
+  );
+  if (doneToday.length) return (
+    <View style={box}>
+      <Chip t={`Completed today · ${fmtDurLong(doneSec)}`} bg={C.greenSoft} fg={C.green} icon="trophy" />
+      <TouchableOpacity onPress={() => onSession(h)} hitSlop={8}><Text style={{ color: C.primary, fontWeight: '800', fontSize: 13 }}>Start another session</Text></TouchableOpacity>
+    </View>
+  );
+  return (
+    <View style={box}>
+      {waiting && <Text style={{ color: C.green, fontWeight: '700', lineHeight: 20 }}>Okay, I'm waiting for you. Go do it and start your session when you're ready.</Text>}
+      <Btn icon="play" label="START SESSION" outline={!waiting} onPress={() => onSession(h)} />
+    </View>
+  );
+}
+
 // ------------------------------------------------------------------ Habits
 const fmtEvery = (sec) => (sec % 60 === 0 ? `${sec / 60} min` : `${sec}s`);
-function Habits({ habits, onEdit, onDelete }) {
+function Habits({ habits, onEdit, onDelete, onSession }) {
   return (
     <View>
       <Text style={s.kicker}>MANAGE</Text>
@@ -403,6 +522,7 @@ function Habits({ habits, onEdit, onDelete }) {
             <View style={[s.row, { marginTop: 10 }]}>
               <Icon name="chatbubble-ellipses-outline" size={15} color={C.sub} />
               <Text style={[s.sub, { flex: 1, marginTop: 0 }]} numberOfLines={1}>{h.chat_url}</Text>
+              <TouchableOpacity onPress={() => onSession(h)} style={s.flameBtn} activeOpacity={0.8}><Icon name="timer-outline" size={16} color={C.flame} /><Text style={s.flameTxt}>Sessions</Text></TouchableOpacity>
             </View>
           </Card>
         </TouchableOpacity>
@@ -619,7 +739,8 @@ function Settings({ cfg, offline, onSignOut, onRefresh }) {
   const [box, setBox] = useState(0);
   const [st, setSt] = useState({});
   const [tone, setTone] = useState('');
-  const load = useCallback(() => { setSt(Alarm.status()); setTone(Alarm.soundName()); getOutbox().then((b) => setBox(b.length)); }, []);
+  const [sync, setSync] = useState({ queued: 0, error: null });
+  const load = useCallback(() => { setSt(Alarm.status()); setTone(Alarm.soundName()); getOutbox().then((b) => setBox(b.length)); syncInfo().then(setSync); }, []);
   useEffect(() => { load(); const sub = AppState.addEventListener('change', (x) => x === 'active' && load()); return () => sub.remove(); }, [load, offline]);
 
   const pick = async () => {
@@ -672,7 +793,8 @@ function Settings({ cfg, offline, onSignOut, onRefresh }) {
         <View style={s.row}><Icon name="person-circle-outline" size={20} color={C.primary} /><Text style={s.cardTitle}>Account & sync</Text></View>
         <Text style={s.sub}>{cfg.email}</Text>
         <Text style={s.sub}>{cfg.url}</Text>
-        <Text style={s.sub}>Connection: {offline ? 'offline' : 'connected'} · queued on phone: {box}</Text>
+        <Text style={s.sub}>Connection: {offline ? 'offline' : 'connected'} · queued on phone: {box + sync.queued}</Text>
+        {!!sync.error && <Text style={{ color: C.red, fontSize: 12, marginTop: 4 }}>Sync error ({sync.error.table}): {sync.error.msg}. Run nudge-v2.sql in Supabase once.</Text>}
         <View style={{ marginTop: 12, gap: 10 }}>
           <Btn icon="sync-outline" label="Sync & rebuild alarms" onPress={onRefresh} outline />
           <Btn icon="log-out-outline" label="Sign out" color={C.red} outline onPress={onSignOut} />
