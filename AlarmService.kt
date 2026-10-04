@@ -216,9 +216,10 @@ class AlarmService : Service() {
   @Suppress("DEPRECATION")
   private fun withActions(b: Notification.Builder): Notification.Builder {
     val icon = android.R.drawable.ic_lock_idle_alarm
+    // Android shows max 3 notification buttons: GOING, NOT GOING, TYPE ANSWER (snooze = tap notification)
     b.addAction(icon, "I'M GOING", activityPi(1, "going"))
     b.addAction(icon, "I'M NOT GOING", activityPi(2, "not_going"))
-    b.addAction(icon, "SNOOZE", activityPi(3, "snoozed"))
+    b.addAction(Decisions.replyAction(this, habitId, name, repeatSec, snoozeMin, notifId(habitId) * 10))
     return b
   }
 
