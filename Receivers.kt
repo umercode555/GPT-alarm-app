@@ -13,6 +13,16 @@ import android.os.Build
 
 class AlarmReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
+    if (intent.action == Decisions.ACTION_RETRY) {
+      val pr = goAsync()
+      Thread {
+        try {
+          val left = Decisions.flushAll(context)
+          if (left > 0) Decisions.scheduleRetry(context) else Store.setRetryCount(context, 0)
+        } catch (e: Exception) { } finally { pr.finish() }
+      }.start()
+      return
+    }
     val i = Intent(context, AlarmService::class.java)
     i.putExtras(intent)
     try {
@@ -27,6 +37,7 @@ class AlarmReceiver : BroadcastReceiver() {
 class BootReceiver : BroadcastReceiver() {
   override fun onReceive(context: Context, intent: Intent) {
     try { Scheduler.restore(context) } catch (e: Exception) { }
+    try { Decisions.scheduleRetry(context) } catch (e: Exception) { }
   }
 }
 
@@ -76,8 +87,7 @@ object Fallback {
     b.addAction(android.R.drawable.ic_lock_idle_alarm, "I'M GOING", pi(1, "going"))
     @Suppress("DEPRECATION")
     b.addAction(android.R.drawable.ic_lock_idle_alarm, "I'M NOT GOING", pi(2, "not_going"))
-    @Suppress("DEPRECATION")
-    b.addAction(android.R.drawable.ic_lock_idle_alarm, "SNOOZE", pi(3, "snoozed"))
+    b.addAction(Decisions.replyAction(c, habitId, name, repeat, snooze, base))
     val n = b.build()
     n.flags = n.flags or Notification.FLAG_INSISTENT or Notification.FLAG_NO_CLEAR
     nm.notify(AlarmService.notifId(habitId), n)
