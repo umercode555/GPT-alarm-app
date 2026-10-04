@@ -16,13 +16,62 @@ import org.json.JSONObject
 import java.io.File
 
 class NudgeAlarmModule : Module() {
+  @Suppress("DEPRECATION")
+  private fun insetsJson(): String {
+    val o = JSONObject()
+    var t = 0; var b = 0; var l = 0; var r = 0
+    try {
+      val ins = appContext.currentActivity?.window?.decorView?.rootWindowInsets
+      if (ins != null) {
+        if (Build.VERSION.SDK_INT >= 30) {
+          val m = ins.getInsets(android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout())
+          t = m.top; b = m.bottom; l = m.left; r = m.right
+        } else { t = ins.systemWindowInsetTop; b = ins.systemWindowInsetBottom; l = ins.systemWindowInsetLeft; r = ins.systemWindowInsetRight }
+      }
+    } catch (e: Exception) { }
+    val d = ctx().resources.displayMetrics.density
+    o.put("top", Math.round(t / d)); o.put("bottom", Math.round(b / d)); o.put("left", Math.round(l / d)); o.put("right", Math.round(r / d))
+    return o.toString()
+  }
+
   private fun ctx(): Context = appContext.reactContext ?: throw IllegalStateException("React context unavailable")
 
   override fun definition() = ModuleDefinition {
     Name("NudgeAlarm")
 
     Function("setSchedule") { json: String ->
-      Scheduler.applyAll(ctx(), json)
+      val c = ctx()
+      try {
+        val arr = JSONArray(json)
+        for (i in 0 until arr.length()) {
+          val o = arr.getJSONObject(i)
+          val chat = o.optString("chatUrl")
+          if (chat.isNotEmpty()) Store.putMeta(c, o.optString("habitId"), o.optString("activity"), chat)
+        }
+      } catch (e: Exception) { }
+      Scheduler.applyAll(c, json)
+      true
+    }
+
+    // credentials so the alarm screen can upload straight to Supabase (called by JS after sign-in)
+    Function("setAuth") { url: String, key: String, email: String, pw: String ->
+      Store.setAuth(ctx(), url, key, email, pw)
+      true
+    }
+
+    // JS passes its current access token as a fallback for sessions made before setAuth existed
+    Function("setToken") { token: String, expMs: Double ->
+      val c = ctx()
+      if (Store.sbPw(c).isEmpty()) Store.setToken(c, token, expMs.toLong())
+      true
+    }
+
+    Function("insets") { ->
+      insetsJson()
+    }
+
+    Function("retryUploads") { ->
+      Decisions.scheduleRetry(ctx())
       true
     }
 
